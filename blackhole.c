@@ -70,8 +70,13 @@
 #define ARC_MSG_TYPE_TRIGGER_RESET 0x56
 #define ARC_MSG_TYPE_POWER_SETTING 0x21
 #define ARC_MSG_TYPE_TEST 0x90
+#define ARC_MSG_TYPE_TT_PCIE_LOG 0xC7
 #define ARC_BOOT_STATUS RESET_SCRATCH(2)
 #define ARC_BOOT_STATUS_READY_FOR_MSG 0x1
+
+// tt_pcie_log sub-commands for ARC_MSG_TYPE_TT_PCIE_LOG
+#define TT_PCIE_LOG_SUBCMD_SETUP   0x1
+#define TT_PCIE_LOG_SUBCMD_RELEASE 0x2
 
 #define IATU_BASE 0x1000	// Relative to the start of BAR2
 #define IATU_OUTBOUND 0
@@ -539,6 +544,212 @@ static bool send_arc_message(struct blackhole_device *bh, struct arc_msg *msg)
 	return msg->header == 0;
 }
 
+// Forward declaration for work handler
+static void fw_log_work_handler(struct work_struct *work);
+
+static void fw_log_work_handler(struct work_struct *work)
+{
+	struct blackhole_device *bh = container_of(work, struct blackhole_device, log_work);
+	struct fw_log_buffer_header *buf_header;
+	struct fw_log_entry_header *entry_header;
+	u32 write_offset, read_offset;
+	char *log_data;
+	const char *source_str;
+
+	if (!bh->tt_pcie_log_enabled || !bh->log_buffer_virt)
+		return;
+
+	buf_header = (struct fw_log_buffer_header *)bh->log_buffer_virt;
+
+	// Validate buffer integrity
+	if (buf_header->magic != FW_LOG_BUFFER_MAGIC) {
+		dev_err(&bh->tt.pdev->dev, "FW log buffer corrupted (magic=0x%x)\n", buf_header->magic);
+		return;
+	}
+
+	// Ensure memory coherency before reading
+	dma_rmb();
+
+	// Check if firmware has handed buffer ownership to host
+	if (buf_header->owner != FW_LOG_BUFFER_OWNER_HOST) {
+		// No new data, nothing to process
+		return;
+	}
+
+	write_offset = buf_header->write_offset;
+
+	// Always start reading from beginning (after header)
+	read_offset = sizeof(struct fw_log_buffer_header);
+
+	// Process all available log entries sequentially
+	while (read_offset < write_offset) {
+		// Check if we have enough space for header
+		if (read_offset + sizeof(struct fw_log_entry_header) > write_offset) {
+			dev_warn(&bh->tt.pdev->dev, "Incomplete header at offset %u\n", read_offset);
+			break;
+		}
+
+		entry_header = (struct fw_log_entry_header *)((u8 *)bh->log_buffer_virt + read_offset);
+
+		// Ensure memory coherency before reading header
+		dma_rmb();
+
+		// Validate entry size
+		if (entry_header->msg_size == 0) {
+			dev_warn(&bh->tt.pdev->dev, "FW log entry with size 0, skipping\n");
+			break;
+		}
+
+		if (entry_header->msg_size < sizeof(struct fw_log_entry_header) ||
+		    entry_header->msg_size > (FW_LOG_BUFFER_SIZE / 2)) {
+			dev_err(&bh->tt.pdev->dev, "Invalid FW log entry size: %u\n", entry_header->msg_size);
+			break;
+		}
+
+		// Check if full message fits in buffer
+		if (read_offset + entry_header->msg_size > write_offset) {
+			dev_warn(&bh->tt.pdev->dev, "Incomplete message at offset %u, size %u\n",
+			         read_offset, entry_header->msg_size);
+			break;
+		}
+
+		// Check for missing entries
+		if (entry_header->sequence != bh->expected_sequence) {
+			dev_warn(&bh->tt.pdev->dev, "FW log gap: expected seq %u, got %u\n",
+			         bh->expected_sequence, entry_header->sequence);
+			bh->expected_sequence = entry_header->sequence;
+		}
+		bh->expected_sequence++;
+
+		// Extract log data (after header)
+		log_data = (char *)entry_header + sizeof(struct fw_log_entry_header);
+
+		// Ensure null termination
+		u32 data_size = entry_header->msg_size - sizeof(struct fw_log_entry_header);
+		if (data_size > 0) {
+			// Temporarily null-terminate for safe printing
+			char saved_char = log_data[data_size - 1];
+			log_data[data_size - 1] = '\0';
+
+			source_str = (entry_header->source == FW_LOG_SOURCE_SMC) ? "SMC" : "DMC";
+
+			// Output to dmesg with appropriate log level
+			switch (entry_header->log_level) {
+			case FW_LOG_LEVEL_ERROR:
+				dev_err(&bh->tt.pdev->dev, "%s: %s\n", source_str, log_data);
+				break;
+			case FW_LOG_LEVEL_WARN:
+				dev_warn(&bh->tt.pdev->dev, "%s: %s\n", source_str, log_data);
+				break;
+			case FW_LOG_LEVEL_INFO:
+				dev_info(&bh->tt.pdev->dev, "%s: %s\n", source_str, log_data);
+				break;
+			case FW_LOG_LEVEL_DEBUG:
+			default:
+				dev_dbg(&bh->tt.pdev->dev, "%s: %s\n", source_str, log_data);
+				break;
+			}
+
+			// Restore original character
+			log_data[data_size - 1] = saved_char;
+		}
+
+		// Move to next entry
+		read_offset += entry_header->msg_size;
+	}
+
+	// Return ownership to firmware after processing the current batch
+	buf_header->owner = FW_LOG_BUFFER_OWNER_FW;
+}
+
+static bool setup_fw_tt_pcie_log(struct blackhole_device *bh)
+{
+	struct arc_msg msg = { 0 };
+
+	dev_info(&bh->tt.pdev->dev, "FW tt_pcie_log initialization\n");
+	if (!bh->log_buffer_virt) {
+		// Allocate coherent DMA buffer for FW tt_pcie_log
+		bh->log_buffer_virt = dma_alloc_coherent(&bh->tt.pdev->dev,
+		                                        FW_LOG_BUFFER_SIZE,
+		                                        &bh->log_buffer_dma,
+		                                        GFP_KERNEL);
+		if (!bh->log_buffer_virt) {
+			dev_err(&bh->tt.pdev->dev, "Failed to allocate FW log buffer\n");
+			return false;
+		}
+		dev_info(&bh->tt.pdev->dev, "Allocated new FW log buffer @ 0x%llx\n",
+		         (unsigned long long)bh->log_buffer_dma);
+	} else {
+		dev_info(&bh->tt.pdev->dev, "Reusing existing FW log buffer @ 0x%llx\n",
+		         (unsigned long long)bh->log_buffer_dma);
+	}
+
+	// Clear buffer before sending message to FW for debug
+	memset(bh->log_buffer_virt, 0, FW_LOG_BUFFER_SIZE);
+
+	// Initialize tracking variables
+	bh->last_read_offset = sizeof(struct fw_log_buffer_header);
+	bh->expected_sequence = 0;
+
+
+	// Send setup message to FW
+	msg.header = ARC_MSG_TYPE_TT_PCIE_LOG | (TT_PCIE_LOG_SUBCMD_SETUP << 8);
+	msg.payload[0] = (u32)bh->log_buffer_dma;  // Lower 32 bits of DMA address
+	msg.payload[1] = (u32)(bh->log_buffer_dma >> 32);  // Upper 32 bits
+	msg.payload[2] = FW_LOG_BUFFER_SIZE;
+
+	if (!send_arc_message(bh, &msg)) {
+		dev_info(&bh->tt.pdev->dev, "Failed to send tt_pcie_log setup message to FW\n");
+		dma_free_coherent(&bh->tt.pdev->dev, FW_LOG_BUFFER_SIZE,
+		                 bh->log_buffer_virt, bh->log_buffer_dma);
+		bh->log_buffer_virt = NULL;
+		return false;
+	}
+
+	if (msg.header != 0) {
+		dev_info(&bh->tt.pdev->dev, "FW rejected tt_pcie_log setup (error 0x%x)\n", msg.header);
+		dma_free_coherent(&bh->tt.pdev->dev, FW_LOG_BUFFER_SIZE,
+		                 bh->log_buffer_virt, bh->log_buffer_dma);
+		bh->log_buffer_virt = NULL;
+		return false;
+	}
+
+	bh->tt_pcie_log_enabled = true;
+	INIT_WORK(&bh->log_work, fw_log_work_handler);
+	dev_info(&bh->tt.pdev->dev, "FW tt_pcie_log initialized successfully\n");
+	return true;
+}
+
+static void release_fw_tt_pcie_log(struct blackhole_device *bh)
+{
+	struct arc_msg msg = { 0 };
+
+	if (!bh->log_buffer_virt)
+		return;
+
+	bh->tt_pcie_log_enabled = false;
+
+	// Cancel any pending work
+	cancel_work_sync(&bh->log_work);
+
+	// Send release message to FW
+	msg.header = ARC_MSG_TYPE_TT_PCIE_LOG | (TT_PCIE_LOG_SUBCMD_RELEASE << 8);
+
+	if (send_arc_message(bh, &msg)) {
+		if (msg.header != 0) {
+			dev_warn(&bh->tt.pdev->dev, "FW reported error during tt_pcie_log release: 0x%x\n", msg.header);
+		}
+	} else {
+		dev_warn(&bh->tt.pdev->dev, "Failed to send tt_pcie_log release message to FW\n");
+	}
+
+	// Free the buffer
+	dma_free_coherent(&bh->tt.pdev->dev, FW_LOG_BUFFER_SIZE,
+	                 bh->log_buffer_virt, bh->log_buffer_dma);
+	bh->log_buffer_virt = NULL;
+	dev_info(&bh->tt.pdev->dev, "FW tt_pcie_log released\n");
+}
+
 static bool blackhole_reset(struct tenstorrent_device *tt_dev, u32 reset_flag)
 {
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
@@ -635,6 +846,10 @@ static bool blackhole_init_hardware(struct tenstorrent_device *tt_dev)
 	if (!send_arc_message(bh, &msg))
 		dev_warn(&tt_dev->pdev->dev, "Failed to set ARC watchdog timeout (this is normal for old FW)\n");
 
+	// Setup FW logging
+	if (!setup_fw_tt_pcie_log(bh))
+		dev_warn(&tt_dev->pdev->dev, "Failed to setup FW logging\n");
+
 	return true;
 }
 
@@ -702,6 +917,10 @@ static void blackhole_cleanup_hardware(struct tenstorrent_device *tt_dev)
 	if (tt_dev->detached)
 		return;
 
+	dev_info(&tt_dev->dev, "Cleanup\n");
+	// Release FW logging before putting device in A3 state
+	//release_fw_tt_pcie_log(bh);
+
 	msg.header = ARC_MSG_TYPE_ASIC_STATE3;
 	if (!send_arc_message(bh, &msg))
 		dev_err(&tt_dev->pdev->dev, "Failed to send ARC message for A3 state\n");
@@ -710,6 +929,7 @@ static void blackhole_cleanup_hardware(struct tenstorrent_device *tt_dev)
 static void blackhole_cleanup(struct tenstorrent_device *tt_dev)
 {
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
+	dev_info(&bh->tt.pdev->dev, "BH cleanup invoked\n");
 
 	if (bh->tlb_regs)
 		pci_iounmap(tt_dev->pdev, bh->tlb_regs);

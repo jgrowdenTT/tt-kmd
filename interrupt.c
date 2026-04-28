@@ -9,11 +9,22 @@
 
 #include "device.h"
 #include "enumerate.h"
+#include "blackhole.h"
 
 static irqreturn_t irq_handler(int irq, void *device)
 {
 	struct tenstorrent_device *tt_dev = device;
-	(void)tt_dev;	// to be used later
+	struct blackhole_device *bh;
+
+	// Check if this is a Blackhole device with tt_pcie_log enabled
+	if (tt_dev->dev_class->name &&
+	    strcmp(tt_dev->dev_class->name, "Blackhole") == 0) {
+		bh = tt_dev_to_bh_dev(tt_dev);
+		if (bh->tt_pcie_log_enabled && bh->log_buffer_virt) {
+			// Schedule log processing work
+			schedule_work(&bh->log_work);
+		}
+	}
 
 	return IRQ_HANDLED;
 }
