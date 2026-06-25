@@ -636,17 +636,17 @@ static void fw_log_work_handler(struct work_struct *work)
 			// Output to dmesg with appropriate log level
 			switch (entry_header->log_level) {
 			case FW_LOG_LEVEL_ERROR:
-				dev_err(&bh->tt.pdev->dev, "%s: %s\n", source_str, log_data);
+				dev_err(&bh->tt.pdev->dev, "%s: %s", source_str, log_data);
 				break;
 			case FW_LOG_LEVEL_WARN:
-				dev_warn(&bh->tt.pdev->dev, "%s: %s\n", source_str, log_data);
+				dev_warn(&bh->tt.pdev->dev, "%s: %s", source_str, log_data);
 				break;
 			case FW_LOG_LEVEL_INFO:
-				dev_info(&bh->tt.pdev->dev, "%s: %s\n", source_str, log_data);
+				dev_info(&bh->tt.pdev->dev, "%s: %s", source_str, log_data);
 				break;
 			case FW_LOG_LEVEL_DEBUG:
 			default:
-				dev_dbg(&bh->tt.pdev->dev, "%s: %s\n", source_str, log_data);
+				dev_dbg(&bh->tt.pdev->dev, "%s: %s", source_str, log_data);
 				break;
 			}
 
@@ -693,7 +693,7 @@ static bool setup_fw_tt_pcie_log(struct blackhole_device *bh)
 
 
 	// Send setup message to FW
-	msg.header = ARC_MSG_TYPE_TT_PCIE_LOG | (TT_PCIE_LOG_SUBCMD_SETUP << 8);
+	msg.header = ARC_MSG_TYPE_TT_PCIE_LOG | (TT_PCIE_LOG_SUBCMD_SETUP << 8) | (0 << 16); // version = 0
 	msg.payload[0] = (u32)bh->log_buffer_dma;  // Lower 32 bits of DMA address
 	msg.payload[1] = (u32)(bh->log_buffer_dma >> 32);  // Upper 32 bits
 	msg.payload[2] = FW_LOG_BUFFER_SIZE;

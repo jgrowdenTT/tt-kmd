@@ -23,7 +23,8 @@ struct fw_log_buffer_header {
 	u32 buffer_size;  // Total buffer size
 	u32 magic;        // Magic number for validation
 	u8 owner;         // Buffer owner: FW or host
-	u8 reserved[3];   // Future use
+	u8 version;       // FW max supported version
+	u8 reserved[2];   // Future use
 } __packed;
 
 // Log level mappings (match Zephyr standard levels)
