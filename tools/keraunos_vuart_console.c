@@ -40,7 +40,7 @@
 #define KER_SMC_PCIE_SPA_BASE   0x1202000000ULL
 #define KER_VUART_MAGIC       0x775e21a1u
 #define KER_VUART_MAX_CAP     4096u
-#define KER_VUART_POLL_US     1000
+#define KER_VUART_POLL_US     1000000
 
 struct tenstorrent_get_device_info {
 	struct {
