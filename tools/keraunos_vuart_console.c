@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/types.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,6 +96,10 @@ struct host_state {
 
 static struct termios g_term_old;
 static int g_term_saved;
+static int g_stdin_tty;
+static int g_stdin_flags_saved;
+static int g_stdin_flags;
+static volatile sig_atomic_t g_stop;
 
 static uint32_t buf_size(uint32_t head, uint32_t tail)
 {
@@ -321,7 +326,11 @@ static int open_tt_dev(const char *path, uint16_t expected_device_id)
 static int set_terminal_raw(void)
 {
 	struct termios t;
-	int flags;
+
+	g_stdin_tty = isatty(STDIN_FILENO);
+	if (!g_stdin_tty) {
+		return 0;
+	}
 
 	if (tcgetattr(STDIN_FILENO, &g_term_old) < 0) {
 		return -errno;
@@ -334,11 +343,12 @@ static int set_terminal_raw(void)
 		return -errno;
 	}
 
-	flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-	if (flags < 0) {
+	g_stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+	if (g_stdin_flags < 0) {
 		return -errno;
 	}
-	if (fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) < 0) {
+	g_stdin_flags_saved = 1;
+	if (fcntl(STDIN_FILENO, F_SETFL, g_stdin_flags | O_NONBLOCK) < 0) {
 		return -errno;
 	}
 
@@ -347,10 +357,21 @@ static int set_terminal_raw(void)
 
 static void restore_terminal(void)
 {
+	if (g_stdin_flags_saved) {
+		(void)fcntl(STDIN_FILENO, F_SETFL, g_stdin_flags);
+		g_stdin_flags_saved = 0;
+	}
+
 	if (g_term_saved) {
-		tcsetattr(STDIN_FILENO, TCSANOW, &g_term_old);
+		tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_term_old);
 		g_term_saved = 0;
 	}
+}
+
+static void handle_signal(int sig)
+{
+	(void)sig;
+	g_stop = 1;
 }
 
 static void usage(const char *prog)
@@ -401,8 +422,15 @@ int main(int argc, char **argv)
 	long dev_id;
 	char *endptr = NULL;
 	struct host_state hs = {0};
+	int ctrl_a_pressed = 0;
 	int helper_mode = 0;
+	int retcode = 0;
 	int rc;
+
+	if (signal(SIGINT, handle_signal) == SIG_ERR) {
+		fprintf(stderr, "failed to install SIGINT handler: %s\n", strerror(errno));
+		return 1;
+	}
 
 	if (argc == 2) {
 		dev_arg = argv[1];
@@ -479,6 +507,10 @@ int main(int argc, char **argv)
 	}
 
 	fprintf(stderr,
+		"Initial pointers: tx_head=%u tx_tail=%u rx_head=%u rx_tail=%u tx_oflow=%u\n",
+		hs.d.tx_head, hs.d.tx_tail, hs.d.rx_head, hs.d.rx_tail, hs.d.tx_oflow);
+
+	fprintf(stderr,
 		"Keraunos VUART: desc=0x%llx tx_cap=%u rx_cap=%u version=0x%08x\n"
 		"Ctrl-C to exit.\n",
 		(unsigned long long)hs.desc_spa, hs.d.tx_cap, hs.d.rx_cap, hs.d.version);
@@ -490,24 +522,45 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	for (;;) {
+	fprintf(stderr, "Press Ctrl-C or Ctrl-a,x to quit\n");
+
+	for (; !g_stop;) {
 		unsigned char ch;
-		ssize_t n = read(STDIN_FILENO, &ch, 1);
+		ssize_t n = -1;
+
+		if (g_stdin_tty) {
+			n = read(STDIN_FILENO, &ch, 1);
+		}
 
 		rc = drain_device_tx(&hs);
 		if (rc && rc != -EAGAIN) {
 			fprintf(stderr, "VUART read failed: %s\n", strerror(-rc));
+			retcode = 1;
 			break;
 		}
 
 		if (n > 0) {
-			rc = send_host_char(&hs, ch);
-			if (rc && rc != -EAGAIN) {
-				fprintf(stderr, "VUART write failed: %s\n", strerror(-rc));
+			if (ctrl_a_pressed) {
+				if (ch == 'x' || ch == 'X') {
+					break;
+				}
+				ctrl_a_pressed = 0;
+			} else if (ch == 0x01) {
+				ctrl_a_pressed = 1;
+				continue;
+			} else if (ch == 0x03) {
 				break;
+			} else {
+				rc = send_host_char(&hs, ch);
+				if (rc && rc != -EAGAIN) {
+					fprintf(stderr, "VUART write failed: %s\n", strerror(-rc));
+					retcode = 1;
+					break;
+				}
 			}
 		} else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 			fprintf(stderr, "stdin read failed: %s\n", strerror(errno));
+			retcode = 1;
 			break;
 		}
 
@@ -516,5 +569,5 @@ int main(int argc, char **argv)
 
 	restore_terminal();
 	close(hs.fd);
-	return 1;
+	return retcode;
 }
