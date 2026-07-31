@@ -135,7 +135,7 @@ static int write32_ioctl(int fd, uint64_t spa, uint32_t value)
 static int read_u8_ioctl(int fd, uint64_t spa, uint8_t *value)
 {
 	uint64_t word_spa = spa & ~0x3ULL;
-	uint32_t word;
+	uint32_t word = 0;
 	uint32_t shift = (uint32_t)((spa & 0x3ULL) * 8ULL);
 	int rc;
 
@@ -151,7 +151,7 @@ static int read_u8_ioctl(int fd, uint64_t spa, uint8_t *value)
 static int write_u8_ioctl(int fd, uint64_t spa, uint8_t value)
 {
 	uint64_t word_spa = spa & ~0x3ULL;
-	uint32_t word;
+	uint32_t word = 0;
 	uint32_t shift = (uint32_t)((spa & 0x3ULL) * 8ULL);
 	uint32_t mask = 0xffu << shift;
 	int rc;
@@ -353,13 +353,13 @@ static void restore_terminal(void)
 
 static void usage(const char *prog)
 {
-	fprintf(stderr, "Usage:\\n");
-	fprintf(stderr, "  %s <device_id>\\n", prog);
-	fprintf(stderr, "  %s --helper <device_id>\\n", prog);
-	fprintf(stderr, "  %s -H <device_id>\\n", prog);
-	fprintf(stderr, "Examples:\\n");
-	fprintf(stderr, "  %s 0\\n", prog);
-	fprintf(stderr, "  %s --helper 0\\n", prog);
+	fprintf(stderr, "Usage:\n");
+	fprintf(stderr, "  %s <device_id>\n", prog);
+	fprintf(stderr, "  %s --helper <device_id>\n", prog);
+	fprintf(stderr, "  %s -H <device_id>\n", prog);
+	fprintf(stderr, "Examples:\n");
+	fprintf(stderr, "  %s 0\n", prog);
+	fprintf(stderr, "  %s --helper 0\n", prog);
 }
 
 static int dump_scratch_helper(int fd)
@@ -378,9 +378,9 @@ static int dump_scratch_helper(int fd)
 		return rc;
 	}
 
-	printf("SCRATCH_0 [0x%012llx] = 0x%08x\\n",
+	printf("SCRATCH_0 [0x%012llx] = 0x%08x\n",
 	       (unsigned long long)KER_SCRATCH0_SPA, scratch0);
-	printf("SCRATCH_2 [0x%012llx] = 0x%08x\\n",
+	printf("SCRATCH_2 [0x%012llx] = 0x%08x\n",
 	       (unsigned long long)KER_SCRATCH2_SPA, scratch2);
 
 	return 0;
@@ -408,21 +408,21 @@ int main(int argc, char **argv)
 
 	dev_id = strtol(dev_arg, &endptr, 0);
 	if (endptr == dev_arg || *endptr != '\0' || dev_id < 0 || dev_id > 255) {
-		fprintf(stderr, "Invalid device_id: %s\\n", dev_arg);
+		fprintf(stderr, "Invalid device_id: %s\n", dev_arg);
 		return 2;
 	}
 
 	snprintf(dev_path, sizeof(dev_path), "/dev/tenstorrent/%ld", dev_id);
 	hs.fd = open_tt_dev(dev_path, KERAUNOS_PCI_DEVICE_ID);
 	if (hs.fd < 0) {
-		fprintf(stderr, "open %s failed: %s\\n", dev_path, strerror(-hs.fd));
+		fprintf(stderr, "open %s failed: %s\n", dev_path, strerror(-hs.fd));
 		return 1;
 	}
 
 	if (helper_mode) {
 		rc = dump_scratch_helper(hs.fd);
 		if (rc) {
-			fprintf(stderr, "helper read failed: %s\\n", strerror(-rc));
+			fprintf(stderr, "helper read failed: %s\n", strerror(-rc));
 			close(hs.fd);
 			return 1;
 		}
@@ -437,45 +437,45 @@ int main(int argc, char **argv)
 		hs.desc_spa = ptr32;
 	}
 	if (rc) {
-		fprintf(stderr, "read scratch2 failed: %s\\n", strerror(-rc));
+		fprintf(stderr, "read scratch2 failed: %s\n", strerror(-rc));
 		close(hs.fd);
 		return 1;
 	}
 	if (hs.desc_spa == 0 || hs.desc_spa == 0xffffffffu) {
-		fprintf(stderr, "scratch2 has invalid VUART pointer: 0x%08x\\n", (uint32_t)hs.desc_spa);
+		fprintf(stderr, "scratch2 has invalid VUART pointer: 0x%08x\n", (uint32_t)hs.desc_spa);
 		close(hs.fd);
 		return 1;
 	}
 
 	rc = read_desc(&hs);
 	if (rc) {
-		fprintf(stderr, "read VUART descriptor @0x%llx failed: %s\\n",
+		fprintf(stderr, "read VUART descriptor @0x%llx failed: %s\n",
 			(unsigned long long)hs.desc_spa, strerror(-rc));
 		close(hs.fd);
 		return 1;
 	}
 
 	if (hs.d.magic != KER_VUART_MAGIC) {
-		fprintf(stderr, "bad VUART magic at 0x%llx: got 0x%08x expected 0x%08x\\n",
+		fprintf(stderr, "bad VUART magic at 0x%llx: got 0x%08x expected 0x%08x\n",
 			(unsigned long long)hs.desc_spa, hs.d.magic, KER_VUART_MAGIC);
 		close(hs.fd);
 		return 1;
 	}
 	if (hs.d.tx_cap == 0 || hs.d.rx_cap == 0 || hs.d.tx_cap > KER_VUART_MAX_CAP ||
 	    hs.d.rx_cap > KER_VUART_MAX_CAP) {
-		fprintf(stderr, "invalid VUART caps tx=%u rx=%u\\n", hs.d.tx_cap, hs.d.rx_cap);
+		fprintf(stderr, "invalid VUART caps tx=%u rx=%u\n", hs.d.tx_cap, hs.d.rx_cap);
 		close(hs.fd);
 		return 1;
 	}
 
 	fprintf(stderr,
-		"Keraunos VUART: desc=0x%llx tx_cap=%u rx_cap=%u version=0x%08x\\n"
-		"Ctrl-C to exit.\\n",
+		"Keraunos VUART: desc=0x%llx tx_cap=%u rx_cap=%u version=0x%08x\n"
+		"Ctrl-C to exit.\n",
 		(unsigned long long)hs.desc_spa, hs.d.tx_cap, hs.d.rx_cap, hs.d.version);
 
 	rc = set_terminal_raw();
 	if (rc) {
-		fprintf(stderr, "failed to set terminal raw mode: %s\\n", strerror(-rc));
+		fprintf(stderr, "failed to set terminal raw mode: %s\n", strerror(-rc));
 		close(hs.fd);
 		return 1;
 	}
@@ -486,18 +486,18 @@ int main(int argc, char **argv)
 
 		rc = drain_device_tx(&hs);
 		if (rc && rc != -EAGAIN) {
-			fprintf(stderr, "VUART read failed: %s\\n", strerror(-rc));
+			fprintf(stderr, "VUART read failed: %s\n", strerror(-rc));
 			break;
 		}
 
 		if (n > 0) {
 			rc = send_host_char(&hs, ch);
 			if (rc && rc != -EAGAIN) {
-				fprintf(stderr, "VUART write failed: %s\\n", strerror(-rc));
+				fprintf(stderr, "VUART write failed: %s\n", strerror(-rc));
 				break;
 			}
 		} else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-			fprintf(stderr, "stdin read failed: %s\\n", strerror(errno));
+			fprintf(stderr, "stdin read failed: %s\n", strerror(errno));
 			break;
 		}
 
