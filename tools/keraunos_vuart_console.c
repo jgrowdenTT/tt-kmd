@@ -36,6 +36,8 @@
 
 #define KER_SCRATCH2_SPA      0x1202010110ULL
 #define KER_SCRATCH0_SPA      0x1202010100ULL
+#define KER_SMC_CORE_LOCAL_BASE 0xC0000000ULL
+#define KER_SMC_PCIE_SPA_BASE   0x1202000000ULL
 #define KER_VUART_MAGIC       0x775e21a1u
 #define KER_VUART_MAX_CAP     4096u
 #define KER_VUART_POLL_US     1000
@@ -366,6 +368,7 @@ static int dump_scratch_helper(int fd)
 {
 	uint32_t scratch0;
 	uint32_t scratch2;
+	uint64_t desc_spa;
 	int rc;
 
 	rc = read32_ioctl(fd, KER_SCRATCH0_SPA, &scratch0);
@@ -382,6 +385,11 @@ static int dump_scratch_helper(int fd)
 	       (unsigned long long)KER_SCRATCH0_SPA, scratch0);
 	printf("SCRATCH_2 [0x%012llx] = 0x%08x\n",
 	       (unsigned long long)KER_SCRATCH2_SPA, scratch2);
+
+	desc_spa = (scratch2 >= KER_SMC_CORE_LOCAL_BASE)
+			   ? (KER_SMC_PCIE_SPA_BASE + ((uint64_t)scratch2 - KER_SMC_CORE_LOCAL_BASE))
+			   : (uint64_t)scratch2;
+	printf("DESC_SPA  [converted]  = 0x%012llx\n", (unsigned long long)desc_spa);
 
 	return 0;
 }
@@ -434,7 +442,9 @@ int main(int argc, char **argv)
 		uint32_t ptr32;
 
 		rc = read32_ioctl(hs.fd, KER_SCRATCH2_SPA, &ptr32);
-		hs.desc_spa = ptr32;
+		hs.desc_spa = (ptr32 >= KER_SMC_CORE_LOCAL_BASE)
+				    ? (KER_SMC_PCIE_SPA_BASE + ((uint64_t)ptr32 - KER_SMC_CORE_LOCAL_BASE))
+				    : (uint64_t)ptr32;
 	}
 	if (rc) {
 		fprintf(stderr, "read scratch2 failed: %s\n", strerror(-rc));
