@@ -47,9 +47,10 @@
 #define KERAUNOS_PCI_DEVICE_ID    0xfeed
 
 #define KER_RESET_CTRL_SPA 0x1202010020ULL
-#define KER_RESET_VECTOR0_SPA 0x1202010000ULL
 #define KER_SMC_CORE_LOCAL_BASE 0xC0000000ULL
 #define KER_SMC_PCIE_SPA_BASE   0x1202000000ULL
+/* Keraunos SMC reset vector default from register map */
+#define KER_SMC_RESET_VECTOR0_LOCAL_DEFAULT 0xC0060000ULL
 /* KeraunosSmcCpu_ResetCtrl_reg_t.core0_reset_n_n0_scan */
 #define KER_RESET_CTRL_CORE0_RESET_N_BIT 0u
 
@@ -219,7 +220,6 @@ static int load_image_to_smc(int fd, const char *image_path)
     int image_fd;
     struct stat st;
     off_t offset = 0;
-    uint32_t reset_vector_local;
     uint64_t load_spa;
 
     image_fd = open(image_path, O_RDONLY);
@@ -241,17 +241,10 @@ static int load_image_to_smc(int fd, const char *image_path)
         return -EINVAL;
     }
 
-    rc = read32_ioctl(fd, KER_RESET_VECTOR0_SPA, &reset_vector_local);
-    if (rc) {
-        fprintf(stderr, "read RESET_VECTOR0 (0x%012llx) failed: %s\n",
-                (unsigned long long)KER_RESET_VECTOR0_SPA, strerror(-rc));
-        close(image_fd);
-        return rc;
-    }
-
-    load_spa = local_addr_to_spa((uint64_t)reset_vector_local);
-    printf("RESET_VECTOR0 local=0x%08x -> load SPA=0x%012llx\n",
-           reset_vector_local, (unsigned long long)load_spa);
+    load_spa = local_addr_to_spa(KER_SMC_RESET_VECTOR0_LOCAL_DEFAULT);
+    printf("Using reset-vector default local=0x%08llx -> load SPA=0x%012llx\n",
+           (unsigned long long)KER_SMC_RESET_VECTOR0_LOCAL_DEFAULT,
+           (unsigned long long)load_spa);
     printf("Loading %lld bytes from %s\n", (long long)st.st_size, image_path);
 
     while (offset < st.st_size) {
