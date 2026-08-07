@@ -16,6 +16,7 @@
 //
 
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <linux/types.h>
 #include <signal.h>
@@ -35,10 +36,11 @@
 #define TENSTORRENT_PCI_VENDOR_ID 0x1e52
 #define KERAUNOS_PCI_DEVICE_ID    0xfeed
 
-#define KER_SCRATCH2_SPA      0x1202010110ULL
-#define KER_SCRATCH0_SPA      0x1202010100ULL
 #define KER_SMC_CORE_LOCAL_BASE 0xC0000000ULL
-#define KER_SMC_PCIE_SPA_BASE   0x1202000000ULL
+#define KER_SPA_BASE_K       0x1202000000ULL
+#define KER_SPA_BASE_M       0x1300000000ULL
+#define KER_SCRATCH2_OFFSET  0x10110ULL
+#define KER_SCRATCH0_OFFSET  0x10100ULL
 #define KER_VUART_MAGIC       0x775e21a1u
 #define KER_VUART_MAX_CAP     4096u
 #define KER_VUART_POLL_US     10000
@@ -100,6 +102,7 @@ static int g_stdin_tty;
 static int g_stdin_flags_saved;
 static int g_stdin_flags;
 static volatile sig_atomic_t g_stop;
+static uint64_t g_spa_base = KER_SPA_BASE_K;
 
 static uint32_t buf_size(uint32_t head, uint32_t tail)
 {
@@ -109,6 +112,34 @@ static uint32_t buf_size(uint32_t head, uint32_t tail)
 static uint32_t buf_space(uint32_t head, uint32_t tail, uint32_t cap)
 {
 	return cap - buf_size(head, tail);
+}
+
+static uint64_t scratch0_spa(void)
+{
+	return g_spa_base + KER_SCRATCH0_OFFSET;
+}
+
+static uint64_t scratch2_spa(void)
+{
+	return g_spa_base + KER_SCRATCH2_OFFSET;
+}
+
+static int parse_mode_arg(const char *arg)
+{
+	if (arg == NULL || arg[0] == '\0' || arg[1] != '\0') {
+		return -EINVAL;
+	}
+
+	switch (tolower((unsigned char)arg[0])) {
+	case 'k':
+		g_spa_base = KER_SPA_BASE_K;
+		return 0;
+	case 'm':
+		g_spa_base = KER_SPA_BASE_M;
+		return 0;
+	default:
+		return -EINVAL;
+	}
 }
 
 static int read32_ioctl(int fd, uint64_t spa, uint32_t *value)
@@ -377,12 +408,12 @@ static void handle_signal(int sig)
 static void usage(const char *prog)
 {
 	fprintf(stderr, "Usage:\n");
-	fprintf(stderr, "  %s <device_id>\n", prog);
-	fprintf(stderr, "  %s --helper <device_id>\n", prog);
-	fprintf(stderr, "  %s -H <device_id>\n", prog);
+	fprintf(stderr, "  %s <k|m> <device_id>\n", prog);
+	fprintf(stderr, "  %s <k|m> --helper <device_id>\n", prog);
+	fprintf(stderr, "  %s <k|m> -H <device_id>\n", prog);
 	fprintf(stderr, "Examples:\n");
-	fprintf(stderr, "  %s 0\n", prog);
-	fprintf(stderr, "  %s --helper 0\n", prog);
+	fprintf(stderr, "  %s k 0\n", prog);
+	fprintf(stderr, "  %s m --helper 0\n", prog);
 }
 
 static int dump_scratch_helper(int fd)
@@ -392,23 +423,23 @@ static int dump_scratch_helper(int fd)
 	uint64_t desc_spa;
 	int rc;
 
-	rc = read32_ioctl(fd, KER_SCRATCH0_SPA, &scratch0);
+	rc = read32_ioctl(fd, scratch0_spa(), &scratch0);
 	if (rc) {
 		return rc;
 	}
 
-	rc = read32_ioctl(fd, KER_SCRATCH2_SPA, &scratch2);
+	rc = read32_ioctl(fd, scratch2_spa(), &scratch2);
 	if (rc) {
 		return rc;
 	}
 
 	printf("SCRATCH_0 [0x%012llx] = 0x%08x\n",
-	       (unsigned long long)KER_SCRATCH0_SPA, scratch0);
+	       (unsigned long long)scratch0_spa(), scratch0);
 	printf("SCRATCH_2 [0x%012llx] = 0x%08x\n",
-	       (unsigned long long)KER_SCRATCH2_SPA, scratch2);
+	       (unsigned long long)scratch2_spa(), scratch2);
 
 	desc_spa = (scratch2 >= KER_SMC_CORE_LOCAL_BASE)
-			   ? (KER_SMC_PCIE_SPA_BASE + ((uint64_t)scratch2 - KER_SMC_CORE_LOCAL_BASE))
+			   ? (g_spa_base + ((uint64_t)scratch2 - KER_SMC_CORE_LOCAL_BASE))
 			   : (uint64_t)scratch2;
 	printf("DESC_SPA  [converted]  = 0x%012llx\n", (unsigned long long)desc_spa);
 
@@ -432,11 +463,23 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (argc == 2) {
-		dev_arg = argv[1];
-	} else if (argc == 3 && (!strcmp(argv[1], "--helper") || !strcmp(argv[1], "-H"))) {
-		helper_mode = 1;
+	if (argc < 3 || argc > 4) {
+		usage(argv[0]);
+		return 2;
+	}
+
+	rc = parse_mode_arg(argv[1]);
+	if (rc) {
+		fprintf(stderr, "Invalid mode '%s'. Expected 'k' or 'm'.\n", argv[1]);
+		usage(argv[0]);
+		return 2;
+	}
+
+	if (argc == 3) {
 		dev_arg = argv[2];
+	} else if (argc == 4 && (!strcmp(argv[2], "--helper") || !strcmp(argv[2], "-H"))) {
+		helper_mode = 1;
+		dev_arg = argv[3];
 	} else {
 		usage(argv[0]);
 		return 2;
@@ -469,9 +512,9 @@ int main(int argc, char **argv)
 	{
 		uint32_t ptr32;
 
-		rc = read32_ioctl(hs.fd, KER_SCRATCH2_SPA, &ptr32);
+		rc = read32_ioctl(hs.fd, scratch2_spa(), &ptr32);
 		hs.desc_spa = (ptr32 >= KER_SMC_CORE_LOCAL_BASE)
-				    ? (KER_SMC_PCIE_SPA_BASE + ((uint64_t)ptr32 - KER_SMC_CORE_LOCAL_BASE))
+				    ? (g_spa_base + ((uint64_t)ptr32 - KER_SMC_CORE_LOCAL_BASE))
 				    : (uint64_t)ptr32;
 	}
 	if (rc) {
