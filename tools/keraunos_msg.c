@@ -12,14 +12,15 @@
 //
 // Run:
 //   ./keraunos_msg <up to 8 words>
-//   ./keraunos_msg <word1> [word2] ... [word8] [device_id]
+//   ./keraunos_msg <word1> [word2] ... [word8]
 //
 // Examples:
 //   ./keraunos_msg 0x90                        # Send test message (MSG_TYPE_TEST)
 //   ./keraunos_msg 0x90 0x1234 0x5678          # Send test message with payload
-//   ./keraunos_msg 0xfe 0 0 0 0 0 0 0 1        # Send SCRATCH_ONLY message
+//   ./keraunos_msg 0xfe 0 0 0 0 0 0 0          # Send SCRATCH_ONLY message
 
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <linux/types.h>
 #include <stdint.h>
@@ -38,18 +39,20 @@
 #define TENSTORRENT_PCI_VENDOR_ID 0x1e52
 #define KERAUNOS_PCI_DEVICE_ID    0xfeed
 
+#define SMC_SPA_BASE_K 0x1202000000ULL
+#define SMC_SPA_BASE_M 0x1300000000ULL
+
 /* SMC CPU Control SCRATCH registers */
-#define SMC_CPUCTRL_SCRATCH_BASE   0x1202010100ULL
+#define SMC_CPUCTRL_SCRATCH_BASE_OFFSET 0x10100ULL
 #define SMC_CPUCTRL_SCRATCH_STRIDE 0x8
-#define SMC_CPUCTRL_SCRATCH(i)     (SMC_CPUCTRL_SCRATCH_BASE + (uint64_t)(i) * SMC_CPUCTRL_SCRATCH_STRIDE)
-#define SCRATCH_3_SPA              SMC_CPUCTRL_SCRATCH(3)
 
 /* Mailbox registers for messaging */
-#define SMC_MBOX_BASE_SPA           0x1202018000ULL
+#define SMC_MBOX_BASE_OFFSET        0x18000ULL
 #define SMC_MBOX_CHANNEL_STRIDE     0x800
 #define SMC_MBOX_TX_CHAN            0
 #define SMC_MBOX_WRITE_DATA_OFFSET  0x00
-#define SMC_MBOX_WRITE_DATA_SPA(chan) (SMC_MBOX_BASE_SPA + ((chan) * SMC_MBOX_CHANNEL_STRIDE) + SMC_MBOX_WRITE_DATA_OFFSET)
+
+static uint64_t g_spa_base = SMC_SPA_BASE_K;
 
 /* Message queue constants */
 #define MSG_QUEUE_SIZE              4
@@ -118,6 +121,36 @@ struct host_state {
 	uint64_t queue_header_spa;
 	struct message_queue_header mq_header;
 };
+
+static uint64_t smc_cpuctrl_scratch_spa(unsigned int idx)
+{
+	return g_spa_base + SMC_CPUCTRL_SCRATCH_BASE_OFFSET +
+	       ((uint64_t)idx * SMC_CPUCTRL_SCRATCH_STRIDE);
+}
+
+static uint64_t smc_mbox_write_data_spa(unsigned int chan)
+{
+	return g_spa_base + SMC_MBOX_BASE_OFFSET +
+	       ((uint64_t)chan * SMC_MBOX_CHANNEL_STRIDE) + SMC_MBOX_WRITE_DATA_OFFSET;
+}
+
+static int parse_mode_arg(const char *arg)
+{
+	if (arg == NULL || arg[0] == '\0' || arg[1] != '\0') {
+		return -EINVAL;
+	}
+
+	switch (tolower((unsigned char)arg[0])) {
+	case 'k':
+		g_spa_base = SMC_SPA_BASE_K;
+		return 0;
+	case 'm':
+		g_spa_base = SMC_SPA_BASE_M;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
 
 static int read32_ioctl(int fd, uint64_t spa, uint32_t *value)
 {
@@ -189,15 +222,16 @@ static int open_tt_dev(const char *path, uint16_t expected_device_id)
 static void usage(const char *prog)
 {
 	fprintf(stderr, "Usage:\n");
-	fprintf(stderr, "  %s <word0> [word1] ... [word7] [device_id]\n", prog);
+	fprintf(stderr, "  %s <k|m> <word0> [word1] ... [word7]\n", prog);
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Send up to 8 words as message data to firmware.\n");
-	fprintf(stderr, "Last argument is interpreted as device_id if > 255.\n");
+	fprintf(stderr, "k uses SPA base 0x12020..., m uses SPA base 0x13000....\n");
+	fprintf(stderr, "Device is fixed to /dev/tenstorrent/0.\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Examples:\n");
-	fprintf(stderr, "  %s 0x90                              # Send message type 0x90\n", prog);
-	fprintf(stderr, "  %s 0x90 0x1234 0x5678                # Send with payload\n", prog);
-	fprintf(stderr, "  %s 0xfe 0 0 0 0 0 0 0 1  # Device 1\n", prog);
+	fprintf(stderr, "  %s k 0x90                            # Send message type 0x90\n", prog);
+	fprintf(stderr, "  %s m 0x90 0x1234 0x5678              # Send with payload\n", prog);
+	fprintf(stderr, "  %s k 0xfe 0 0 0 0 0 0 0              # SCRATCH_ONLY\n", prog);
 }
 
 static int read_mq_header(struct host_state *hs)
@@ -379,7 +413,7 @@ static int poke_mailbox(int fd)
 	int rc;
 
 	/* Write to mailbox TX channel to notify firmware */
-	rc = write64_ioctl(fd, SMC_MBOX_WRITE_DATA_SPA(SMC_MBOX_TX_CHAN), 0);
+	rc = write64_ioctl(fd, smc_mbox_write_data_spa(SMC_MBOX_TX_CHAN), 0);
 	if (rc) {
 		fprintf(stderr, "Failed to poke mailbox: %s\n", strerror(-rc));
 		return rc;
@@ -393,7 +427,6 @@ int main(int argc, char **argv)
 	struct host_state hs;
 	struct arc_msg request = {0};
 	struct arc_msg response = {0};
-	uint32_t device_id = 0;
 	int32_t word_count = 0;
 	int rc;
 	int i;
@@ -401,13 +434,20 @@ int main(int argc, char **argv)
 	uint32_t parsed_val;
 	char *endptr;
 
-	if (argc < 2) {
+	if (argc < 3) {
+		usage(argv[0]);
+		return 1;
+	}
+
+	rc = parse_mode_arg(argv[1]);
+	if (rc) {
+		fprintf(stderr, "Invalid mode '%s'. Expected 'k' or 'm'.\n", argv[1]);
 		usage(argv[0]);
 		return 1;
 	}
 
 	/* Parse arguments */
-	for (i = 1; i < argc; i++) {
+	for (i = 2; i < argc; i++) {
 		errno = 0;
 		parsed_val = (uint32_t)strtoul(argv[i], &endptr, 0);
 
@@ -417,22 +457,17 @@ int main(int argc, char **argv)
 			return 1;
 		}
 
-		/* If value > 255 and it's the last argument, treat as device_id */
-		if (i == argc - 1 && parsed_val > 255 && word_count == (int32_t)(i - 2)) {
-			device_id = parsed_val;
-		} else {
-			if (word_count >= (int32_t)REQUEST_MSG_LEN) {
-				fprintf(stderr, "Too many message words (max %d)\n", REQUEST_MSG_LEN);
-				return 1;
-			}
-
-			if (word_count == 0) {
-				request.header = parsed_val;
-			} else {
-				request.payload[word_count - 1] = parsed_val;
-			}
-			word_count++;
+		if (word_count >= (int32_t)REQUEST_MSG_LEN) {
+			fprintf(stderr, "Too many message words (max %d)\n", REQUEST_MSG_LEN);
+			return 1;
 		}
+
+		if (word_count == 0) {
+			request.header = parsed_val;
+		} else {
+			request.payload[word_count - 1] = parsed_val;
+		}
+		word_count++;
 	}
 
 	if (word_count == 0) {
@@ -442,7 +477,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Construct device path */
-	snprintf(device_path, sizeof(device_path), "/dev/tenstorrent/%u", device_id);
+	snprintf(device_path, sizeof(device_path), "/dev/tenstorrent/0");
 
 	/* Open device */
 	hs.fd = open_tt_dev(device_path, KERAUNOS_PCI_DEVICE_ID);
@@ -454,7 +489,7 @@ int main(int argc, char **argv)
 	/* Get message queue info pointer from SCRATCH_3 */
 	uint32_t mq_info_ptr = 0;
 	uint32_t mq_base_ptr = 0;
-	rc = read32_ioctl(hs.fd, SCRATCH_3_SPA, &mq_info_ptr);
+	rc = read32_ioctl(hs.fd, smc_cpuctrl_scratch_spa(3), &mq_info_ptr);
 	if (rc) {
 		fprintf(stderr, "Failed to read SCRATCH_3: %s\n", strerror(-rc));
 		close(hs.fd);
@@ -468,7 +503,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Convert message_queue_info pointer to SPA */
-	uint64_t mq_info_spa = 0x1202000000ULL + (mq_info_ptr & 0xfffffffULL);
+	uint64_t mq_info_spa = g_spa_base + (mq_info_ptr & 0xfffffffULL);
 
 	/* Read message_queue_info[0] which contains pointer to message_queues */
 	rc = read32_ioctl(hs.fd, mq_info_spa, &mq_base_ptr);
@@ -485,7 +520,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Convert message_queues base pointer to SPA */
-	hs.queue_header_spa = 0x1202000000ULL + (mq_base_ptr & 0xfffffffULL);
+	hs.queue_header_spa = g_spa_base + (mq_base_ptr & 0xfffffffULL);
 
 	printf("Message queue info SPA: 0x%012" PRIx64 "\n", mq_info_spa);
 	printf("Message queue header SPA: 0x%012" PRIx64 "\n", hs.queue_header_spa);
