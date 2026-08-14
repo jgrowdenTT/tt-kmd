@@ -51,11 +51,12 @@
 #define KER_SPA_BASE_K          0x1202000000ULL
 #define KER_SPA_BASE_M          0x1300000000ULL
 #define KER_RESET_CTRL_OFFSET   0x10020ULL
+#define KER_RESET_VECTOR0_OFFSET 0x10000ULL
 #define KER_SCRATCH_BASE_OFFSET 0x10100ULL
 #define KER_SCRATCH_STRIDE      0x8ULL
 #define KER_SCRATCH_DUMP_COUNT  4u
-/* Keraunos SMC reset vector default from register map */
-#define KER_SMC_RESET_VECTOR0_LOCAL_DEFAULT 0xC0060000ULL
+/* BL1/Zephyr execution address; BL0 remains at 0xC0040000. */
+#define KER_SMC_BL1_RESET_VECTOR 0xC0060000ULL
 /* KeraunosSmcCpu_ResetCtrl_reg_t.core0_reset_n_n0_scan */
 #define KER_RESET_CTRL_CORE0_RESET_N_BIT 0u
 
@@ -187,6 +188,41 @@ static uint64_t reset_ctrl_spa(void)
     return g_spa_base + KER_RESET_CTRL_OFFSET;
 }
 
+static uint64_t reset_vector0_spa(void)
+{
+    return g_spa_base + KER_RESET_VECTOR0_OFFSET;
+}
+
+static int set_bl1_reset_vector(int fd)
+{
+    int rc;
+    uint32_t readback;
+
+    rc = write32_ioctl(fd, reset_vector0_spa(), (uint32_t)KER_SMC_BL1_RESET_VECTOR);
+    if (rc) {
+        fprintf(stderr, "write RESET_VECTOR[0] (0x%012llx) failed: %s\n",
+                (unsigned long long)reset_vector0_spa(), strerror(-rc));
+        return rc;
+    }
+
+    rc = read32_ioctl(fd, reset_vector0_spa(), &readback);
+    if (rc) {
+        fprintf(stderr, "readback RESET_VECTOR[0] (0x%012llx) failed: %s\n",
+                (unsigned long long)reset_vector0_spa(), strerror(-rc));
+        return rc;
+    }
+
+    if (readback != (uint32_t)KER_SMC_BL1_RESET_VECTOR) {
+        fprintf(stderr, "RESET_VECTOR[0] readback mismatch: expected 0x%08x got 0x%08x\n",
+                (uint32_t)KER_SMC_BL1_RESET_VECTOR, readback);
+        return -EIO;
+    }
+
+    printf("RESET_VECTOR[0] = 0x%08x (SPA=0x%012llx)\n",
+           readback, (unsigned long long)reset_vector0_spa());
+    return 0;
+}
+
 static uint64_t scratch_spa(unsigned int idx)
 {
     return g_spa_base + KER_SCRATCH_BASE_OFFSET + ((uint64_t)idx * KER_SCRATCH_STRIDE);
@@ -311,9 +347,9 @@ static int load_image_to_smc(int fd, const char *image_path)
         return -EINVAL;
     }
 
-    load_spa = local_addr_to_spa(KER_SMC_RESET_VECTOR0_LOCAL_DEFAULT);
+    load_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
     printf("Using reset-vector default local=0x%08llx -> load SPA=0x%012llx\n",
-           (unsigned long long)KER_SMC_RESET_VECTOR0_LOCAL_DEFAULT,
+           (unsigned long long)KER_SMC_BL1_RESET_VECTOR,
            (unsigned long long)load_spa);
     printf("Loading %lld bytes from %s\n", (long long)st.st_size, image_path);
 
@@ -399,7 +435,7 @@ static int verify_image_in_smc(int fd, const char *image_path)
         return -EINVAL;
     }
 
-    load_spa = local_addr_to_spa(KER_SMC_RESET_VECTOR0_LOCAL_DEFAULT);
+    load_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
     printf("Verifying %lld bytes at SPA=0x%012llx\n",
            (long long)st.st_size, (unsigned long long)load_spa);
 
@@ -542,6 +578,12 @@ int main(int argc, char **argv)
         }
 
         rc = verify_image_in_smc(fd, image_path);
+        if (rc) {
+            close(fd);
+            return 1;
+        }
+
+        rc = set_bl1_reset_vector(fd);
         if (rc) {
             close(fd);
             return 1;
