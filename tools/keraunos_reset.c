@@ -57,6 +57,9 @@
 #define KER_SCRATCH_DUMP_COUNT  4u
 /* BL1/Zephyr execution address; BL0 remains at 0xC0040000. */
 #define KER_SMC_BL1_RESET_VECTOR 0xC0060000ULL
+#define KER_SMC_BL0_RESET_VECTOR 0xC0040000ULL
+#define KER_SMC_SRAM_BASE 0xC0060000ULL
+#define KER_SMC_SRAM_SIZE 0x00100000ULL
 /* KeraunosSmcCpu_ResetCtrl_reg_t.core0_reset_n_n0_scan */
 #define KER_RESET_CTRL_CORE0_RESET_N_BIT 0u
 
@@ -155,10 +158,12 @@ static void usage(const char *prog)
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s <k|m> <0|1> [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> -i <image.bin> [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m> --bl0 [device_id]\n", prog);
     fprintf(stderr, "  k = SPA base 0x12020..., m = SPA base 0x13000...\n");
     fprintf(stderr, "  0 = hold SMC RISC-V in reset\n");
     fprintf(stderr, "  1 = release SMC RISC-V from reset\n");
     fprintf(stderr, "  -i = hold reset, load image, release reset\n");
+    fprintf(stderr, "  --bl0 = hold reset, wipe SRAM, set RESET_VECTOR[0] to 0xC0040000, release reset\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s k 0\n", prog);
     fprintf(stderr, "  %s k 1 3\n", prog);
@@ -193,12 +198,14 @@ static uint64_t reset_vector0_spa(void)
     return g_spa_base + KER_RESET_VECTOR0_OFFSET;
 }
 
-static int set_bl1_reset_vector(int fd)
+static uint64_t local_addr_to_spa(uint64_t addr);
+
+static int set_reset_vector(int fd, uint64_t reset_vector)
 {
     int rc;
     uint32_t readback;
 
-    rc = write32_ioctl(fd, reset_vector0_spa(), (uint32_t)KER_SMC_BL1_RESET_VECTOR);
+    rc = write32_ioctl(fd, reset_vector0_spa(), (uint32_t)reset_vector);
     if (rc) {
         fprintf(stderr, "write RESET_VECTOR[0] (0x%012llx) failed: %s\n",
                 (unsigned long long)reset_vector0_spa(), strerror(-rc));
@@ -212,14 +219,37 @@ static int set_bl1_reset_vector(int fd)
         return rc;
     }
 
-    if (readback != (uint32_t)KER_SMC_BL1_RESET_VECTOR) {
+    if (readback != (uint32_t)reset_vector) {
         fprintf(stderr, "RESET_VECTOR[0] readback mismatch: expected 0x%08x got 0x%08x\n",
-                (uint32_t)KER_SMC_BL1_RESET_VECTOR, readback);
+                (uint32_t)reset_vector, readback);
         return -EIO;
     }
 
     printf("RESET_VECTOR[0] = 0x%08x (SPA=0x%012llx)\n",
            readback, (unsigned long long)reset_vector0_spa());
+    return 0;
+}
+
+static int set_bl1_reset_vector(int fd)
+{
+    return set_reset_vector(fd, KER_SMC_BL1_RESET_VECTOR);
+}
+
+static int wipe_smc_sram(int fd)
+{
+    uint64_t base = local_addr_to_spa(KER_SMC_SRAM_BASE);
+    uint64_t end = base + KER_SMC_SRAM_SIZE;
+
+    printf("Wiping SMC SRAM at SPA=0x%012llx..0x%012llx\n",
+           (unsigned long long)base, (unsigned long long)(end - 1));
+    for (uint64_t spa = base; spa < end; spa += sizeof(uint32_t)) {
+        int rc = write32_ioctl(fd, spa, 0u);
+        if (rc) {
+            fprintf(stderr, "write SRAM zero at SPA 0x%012llx failed: %s\n",
+                    (unsigned long long)spa, strerror(-rc));
+            return rc;
+        }
+    }
     return 0;
 }
 
@@ -506,6 +536,7 @@ int main(int argc, char **argv)
     char *endptr = NULL;
     const char *image_path = NULL;
     int image_mode = 0;
+    int bl0_mode = 0;
     int fd;
     int rc;
 
@@ -521,7 +552,21 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    if (!strcmp(argv[2], "-i")) {
+    if (!strcmp(argv[2], "--bl0")) {
+        bl0_mode = 1;
+        if (argc != 3 && argc != 4) {
+            usage(argv[0]);
+            return 2;
+        }
+        if (argc == 4) {
+            endptr = NULL;
+            dev_id = strtol(argv[3], &endptr, 0);
+            if (endptr == argv[3] || *endptr != '\0' || dev_id < 0 || dev_id > 255) {
+                fprintf(stderr, "Invalid device_id: %s\n", argv[3]);
+                return 2;
+            }
+        }
+    } else if (!strcmp(argv[2], "-i")) {
         image_mode = 1;
         if (argc != 4 && argc != 5) {
             usage(argv[0]);
@@ -564,7 +609,31 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (image_mode) {
+    if (bl0_mode) {
+        rc = set_reset_state(fd, 0u);
+        if (rc) {
+            close(fd);
+            return 1;
+        }
+
+        rc = wipe_smc_sram(fd);
+        if (rc) {
+            close(fd);
+            return 1;
+        }
+
+        rc = set_reset_vector(fd, KER_SMC_BL0_RESET_VECTOR);
+        if (rc) {
+            close(fd);
+            return 1;
+        }
+
+        rc = set_reset_state(fd, 1u);
+        if (rc) {
+            close(fd);
+            return 1;
+        }
+    } else if (image_mode) {
         rc = set_reset_state(fd, 0u);
         if (rc) {
             close(fd);
