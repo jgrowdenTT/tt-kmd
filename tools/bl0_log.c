@@ -6,8 +6,8 @@
 //   gcc -O2 -Wall -Wextra -Werror -o bl0_log bl0_log.c
 //
 // Run:
-//   ./bl0_log <k|m> [device_id] [--once]
-//   ./bl0_log <k|m> [device_id] --interval-ms <milliseconds>
+//   ./bl0_log <k|m> [device_id]
+//   ./bl0_log <k|m> [device_id] --follow --interval-ms <milliseconds>
 
 #include <ctype.h>
 #include <errno.h>
@@ -129,11 +129,51 @@ static const char *status_value_name(uint16_t value)
 {
     switch (value) {
     case 0x0001:
-        return "INIT";
-    case 0x0004:
+        return "ROM_STARTED/STATUS_INIT";
+    case 0x0010:
+        return "BOOT_START";
+    case 0x0020:
+        return "RECOVERY_MODE";
+    case 0x0021:
+        return "PRIMARY_MODE";
+    case 0x0022:
+        return "SECONDARY_MODE";
+    case 0x0025:
+        return "INVALID_SECURITY_MODE";
+    case 0x0030:
+        return "OCCP_INIT_FAILED";
+    case 0x0031:
         return "OCCP_READY";
-    case 0x0005:
+    case 0x0040:
+        return "COORDINATION_ACTIVE";
+    case 0x0050:
         return "BOOT_COMPLETE";
+    case 0x00ff:
+        return "UNEXPECTED_EXIT";
+    case 0x0100:
+        return "OCCP_CMD_READ_ERROR";
+    case 0x0101:
+        return "OCCP_CMD_UNKNOWN";
+    case 0x0110:
+        return "OCCP_CMD_FAILED";
+    case 0x0120:
+        return "OCCP_READ_OVERFLOW";
+    case 0x0121:
+        return "OCCP_READ_ACCESS_DENIED";
+    case 0x0130:
+        return "OCCP_WRITE_OVERFLOW";
+    case 0x0131:
+        return "OCCP_WRITE_ACCESS_DENIED";
+    case 0x0140:
+        return "OCCP_VALIDATE_SECURITY";
+    case 0x0141:
+        return "OCCP_VALIDATE_ADDRESS_FAILED";
+    case 0x0200:
+        return "OCCP_JUMP_EXECUTED";
+    case 0x0201:
+        return "OCCP_JUMP_SECURITY";
+    case 0x0202:
+        return "OCCP_JUMP_READ_FAILED";
     default:
         return "";
     }
@@ -217,15 +257,15 @@ static void sleep_ms(unsigned int milliseconds)
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "Usage: %s <k|m> [device_id] [--once]\n", program);
-    fprintf(stderr, "       %s <k|m> [device_id] --interval-ms <milliseconds>\n", program);
+    fprintf(stderr, "Usage: %s <k|m> [device_id]\n", program);
+    fprintf(stderr, "       %s <k|m> [device_id] --follow [--interval-ms <milliseconds>]\n", program);
 }
 
 int main(int argc, char **argv)
 {
     long device_id = 0;
     unsigned int interval_ms = DEFAULT_INTERVAL_MS;
-    int once = 0;
+    int follow = 0;
     int fd;
     int rc;
     char *end;
@@ -239,8 +279,8 @@ int main(int argc, char **argv)
     g_spa_base = (argv[1][0] == 'm' || argv[1][0] == 'M') ? MIMIR_SPA_BASE : KER_SPA_BASE;
 
     for (int argument = 2; argument < argc; argument++) {
-        if (strcmp(argv[argument], "--once") == 0) {
-            once = 1;
+        if (strcmp(argv[argument], "--follow") == 0) {
+            follow = 1;
         } else if (strcmp(argv[argument], "--interval-ms") == 0 && argument + 1 < argc) {
             unsigned long parsed = strtoul(argv[++argument], &end, 0);
             if (*argv[argument] == '\0' || *end != '\0' || parsed > 60000u) {
@@ -276,10 +316,10 @@ int main(int argc, char **argv)
             close(fd);
             return 1;
         }
-        if (!once) {
+        if (follow) {
             sleep_ms(interval_ms);
         }
-    } while (!once);
+    } while (follow);
 
     close(fd);
     return 0;
