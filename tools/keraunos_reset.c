@@ -536,6 +536,8 @@ int main(int argc, char **argv)
     char *endptr = NULL;
     const char *image_path = NULL;
     int image_mode = 0;
+    int verify = 0;
+    int scratch = 0;
     int bl0_mode = 0;
     int fd;
     int rc;
@@ -581,6 +583,24 @@ int main(int argc, char **argv)
                 return 2;
             }
         }
+    } else if (!strcmp(argv[2], "-v")) {
+        verify = 1;
+        if (argc != 4 && argc != 5) {
+            usage(argv[0]);
+            return 2;
+        }
+        image_path = argv[3];
+        if (argc == 5) {
+            endptr = NULL;
+            dev_id = strtol(argv[4], &endptr, 0);
+            if (endptr == argv[4] || *endptr != '\0' || dev_id < 0 || dev_id > 255)
+            {
+                fprintf(stderr, "Invalid device_id: %s\n", argv[4]);
+                return 2;
+            }
+        }
+    } else if (!strcmp(argv[2], "-s")) {
+        scratch = 1;
     } else {
         if (argc != 3 && argc != 4) {
             usage(argv[0]);
@@ -666,6 +686,20 @@ int main(int argc, char **argv)
 
         rc = dump_post_reset_registers(fd);
         if (rc) {
+            close(fd);
+            return 1;
+        }
+    } else if (verify) {
+        rc = verify_image_in_smc(fd, image_path);
+        if (rc)
+        {
+            close(fd);
+            return 1;
+        }
+    } else if (scratch) {
+        rc = dump_post_reset_registers(fd);
+        if (rc)
+        {
             close(fd);
             return 1;
         }
