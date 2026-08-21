@@ -55,13 +55,40 @@
 #define KER_SCRATCH_BASE_OFFSET 0x10100ULL
 #define KER_SCRATCH_STRIDE      0x8ULL
 #define KER_SCRATCH_DUMP_COUNT  4u
+#define KER_SCRATCH_CLEAR_COUNT 16u  /* covers indices 0-15, above our highest use of [12] */
 /* BL1/Zephyr image and execution address; BL0 owns SRAM below 0xC0067000. */
 #define KER_SMC_BL1_RESET_VECTOR 0xC0067000ULL
 #define KER_SMC_BL0_RESET_VECTOR 0xC0040000ULL
 #define KER_SMC_SRAM_BASE 0xC0060000ULL
 #define KER_SMC_SRAM_SIZE 0x00100000ULL
+/* Bundle staging area is the upper 512KB of SRAM */
+#define KER_SMC_BUNDLE_STAGING_BASE (KER_SMC_SRAM_BASE + 0x80000ULL)
 /* KeraunosSmcCpu_ResetCtrl_reg_t.core0_reset_n_n0_scan */
 #define KER_RESET_CTRL_CORE0_RESET_N_BIT 0u
+
+/* BL0P5 execute location: 64KB from end of ram0 (0xC015b000 - 0x10000) */
+#define KER_SMC_BL0P5_LOAD_ADDR         0xC014B000ULL
+/* Scratch registers used for the BL0P5 <-> host handshake (local addresses) */
+#define KER_HOST_BOOT_STATE_LOCAL        0xC0010160ULL  /* SCRATCH[12] */
+#define KER_BUNDLE_VALIDATION_LOCAL      0xC0010150ULL  /* SCRATCH[10] */
+/* Handshake values written to the host-boot-state scratch register */
+#define HOST_BOOT_STATE_WAIT_FOR_BUNDLE  1u
+#define HOST_BOOT_STATE_BUNDLE_STAGED    2u
+/* Bits in the bundle-validation scratch register */
+#define BUNDLE_READY_FOR_VALIDATION_BIT  0x1u
+#define BUNDLE_VALIDATED_BIT             0x2u
+/* fw_bundle_manifest/toc layout constants (from tt_bundle_loader.h) */
+#define BUNDLE_MANIFEST_SIZE             1184u
+#define BUNDLE_MANIFEST_PAYLOAD_OFF_OFF  1160u   /* byte offset of payload_offset in manifest */
+#define BUNDLE_TOC_ID                    0x434f5450u  /* "PTOC" */
+#define BUNDLE_TOC_HDR_SIZE              32u
+#define BUNDLE_TOC_VERSION_MAJOR         1u
+#define BUNDLE_TOC_ENTRY_SIZE            216u
+#define BUNDLE_TOC_IMG_TYPE_BL1_LO       0x42434d53u  /* low  32b of FW_BUNDLE_IMG_TYPE_SMC_BL1 */
+#define BUNDLE_TOC_IMG_TYPE_BL1_HI       0x0000314cu  /* high 32b of FW_BUNDLE_IMG_TYPE_SMC_BL1 */
+/* Offset from payload start (= toc base) to the image data */
+#define BUNDLE_IMG_PAYLOAD_OFFSET        (BUNDLE_TOC_HDR_SIZE + BUNDLE_TOC_ENTRY_SIZE)
+#define BUNDLE_POLL_TIMEOUT_US           10000000u  /* 10 s */
 
 struct tenstorrent_get_device_info {
     struct {
@@ -157,17 +184,20 @@ static void usage(const char *prog)
 {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s <k|m> <0|1> [device_id]\n", prog);
-    fprintf(stderr, "  %s <k|m> -i <image.bin> [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m> -i <bl1.bin> [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m> -i <bl1.bin> --blop5 <blop5.bin> [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> --bl0 [device_id]\n", prog);
     fprintf(stderr, "  k = SPA base 0x12020..., m = SPA base 0x13000...\n");
     fprintf(stderr, "  0 = hold SMC RISC-V in reset\n");
     fprintf(stderr, "  1 = release SMC RISC-V from reset\n");
     fprintf(stderr, "  -i = hold reset, load image, release reset\n");
+    fprintf(stderr, "  -i + --blop5 = load blop5.bin, boot it, handshake bundle of bl1.bin\n");
     fprintf(stderr, "  --bl0 = hold reset, wipe SRAM, set RESET_VECTOR[0] to 0xC0040000, release reset\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s k 0\n", prog);
     fprintf(stderr, "  %s k 1 3\n", prog);
     fprintf(stderr, "  %s m -i build/zephyr/zephyr.bin\n", prog);
+    fprintf(stderr, "  %s k -i build_k/zephyr/zephyr.bin --blop5 build_blop5/zephyr/zephyr.bin\n", prog);
 }
 
 static int parse_mode_arg(const char *arg)
@@ -293,6 +323,22 @@ static int dump_post_reset_registers(int fd)
     return 0;
 }
 
+static int clear_scratch_regs(int fd)
+{
+    unsigned int i;
+
+    printf("Clearing %u scratch registers\n", KER_SCRATCH_CLEAR_COUNT);
+    for (i = 0; i < KER_SCRATCH_CLEAR_COUNT; i++) {
+        int rc = write32_ioctl(fd, scratch_spa(i), 0u);
+        if (rc) {
+            fprintf(stderr, "clear SCRATCH_%u (0x%012llx) failed: %s\n",
+                    i, (unsigned long long)scratch_spa(i), strerror(-rc));
+            return rc;
+        }
+    }
+    return 0;
+}
+
 static int set_reset_state(int fd, uint32_t requested_state)
 {
     int rc;
@@ -350,13 +396,12 @@ static uint64_t local_addr_to_spa(uint64_t addr)
     return addr;
 }
 
-static int load_image_to_smc(int fd, const char *image_path)
+static int load_image_to_spa(int fd, const char *image_path, uint64_t load_spa)
 {
     int rc;
     int image_fd;
     struct stat st;
     off_t offset = 0;
-    uint64_t load_spa;
 
     image_fd = open(image_path, O_RDONLY);
     if (image_fd < 0) {
@@ -377,11 +422,8 @@ static int load_image_to_smc(int fd, const char *image_path)
         return -EINVAL;
     }
 
-    load_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
-    printf("Using reset-vector default local=0x%08llx -> load SPA=0x%012llx\n",
-           (unsigned long long)KER_SMC_BL1_RESET_VECTOR,
-           (unsigned long long)load_spa);
-    printf("Loading %lld bytes from %s\n", (long long)st.st_size, image_path);
+    printf("Loading %lld bytes from %s to SPA=0x%012llx\n",
+           (long long)st.st_size, image_path, (unsigned long long)load_spa);
 
     while (offset < st.st_size) {
         uint8_t bytes[4] = {0, 0, 0, 0};
@@ -436,6 +478,16 @@ static int load_image_to_smc(int fd, const char *image_path)
 
     close(image_fd);
     return 0;
+}
+
+static int load_image_to_smc(int fd, const char *image_path)
+{
+    uint64_t load_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
+
+    printf("Using reset-vector default local=0x%08llx -> load SPA=0x%012llx\n",
+           (unsigned long long)KER_SMC_BL1_RESET_VECTOR,
+           (unsigned long long)load_spa);
+    return load_image_to_spa(fd, image_path, load_spa);
 }
 
 static int verify_image_in_smc(int fd, const char *image_path)
@@ -528,6 +580,202 @@ static int verify_image_in_smc(int fd, const char *image_path)
     return 0;
 }
 
+static int poll_scratch_eq(int fd, uint64_t spa, uint32_t expected)
+{
+    uint32_t val = 0;
+    int rc;
+    uint32_t elapsed_us = 0;
+
+    printf("Polling SPA=0x%012llx == 0x%08x...\n", (unsigned long long)spa, expected);
+    for (;;) {
+        rc = read32_ioctl(fd, spa, &val);
+        if (rc) {
+            fprintf(stderr, "read SPA 0x%012llx failed: %s\n",
+                    (unsigned long long)spa, strerror(-rc));
+            return rc;
+        }
+        if (val == expected) {
+            printf("  -> 0x%08x\n", val);
+            return 0;
+        }
+        usleep(10000);
+        elapsed_us += 10000;
+        if (elapsed_us >= BUNDLE_POLL_TIMEOUT_US) {
+            fprintf(stderr, "timeout: SPA 0x%012llx expected 0x%08x, got 0x%08x\n",
+                    (unsigned long long)spa, expected, val);
+            return -ETIMEDOUT;
+        }
+    }
+}
+
+static int poll_scratch_bit(int fd, uint64_t spa, uint32_t mask)
+{
+    uint32_t val = 0;
+    int rc;
+    uint32_t elapsed_us = 0;
+
+    printf("Polling SPA=0x%012llx & 0x%08x...\n", (unsigned long long)spa, mask);
+    for (;;) {
+        rc = read32_ioctl(fd, spa, &val);
+        if (rc) {
+            fprintf(stderr, "read SPA 0x%012llx failed: %s\n",
+                    (unsigned long long)spa, strerror(-rc));
+            return rc;
+        }
+        if ((val & mask) == mask) {
+            printf("  -> 0x%08x\n", val);
+            return 0;
+        }
+        usleep(10000);
+        elapsed_us += 10000;
+        if (elapsed_us >= BUNDLE_POLL_TIMEOUT_US) {
+            fprintf(stderr, "timeout: SPA 0x%012llx mask 0x%08x, got 0x%08x\n",
+                    (unsigned long long)spa, mask, val);
+            return -ETIMEDOUT;
+        }
+    }
+}
+
+/*
+ * Write a minimal fw_bundle_manifest + fw_bundle_toc + fw_bundle_toc_entry[0] + image
+ * into the staging area so the bun2 loader can parse and copy it.
+ *
+ * Staging area layout (all offsets from KER_SMC_SRAM_BASE):
+ *   [0 .. 1183]   fw_bundle_manifest  (only payload_offset at +1160 matters)
+ *   [1184 .. 1215] fw_bundle_toc header (32 bytes)
+ *   [1216 .. 1431] fw_bundle_toc_entry[0] (216 bytes)
+ *   [1432 .. ]    BL1 image data
+ */
+static int write_bundle_to_staging(int fd, const char *bl1_path, off_t image_size)
+{
+    int rc;
+    uint32_t i;
+    uint64_t staging_spa = local_addr_to_spa(KER_SMC_BUNDLE_STAGING_BASE);
+    uint32_t hdr_words = (BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + BUNDLE_TOC_ENTRY_SIZE) / 4;
+    uint32_t payload_len = BUNDLE_TOC_HDR_SIZE + BUNDLE_TOC_ENTRY_SIZE + (uint32_t)image_size;
+    uint64_t toc_spa   = staging_spa + BUNDLE_MANIFEST_SIZE;
+    uint64_t entry_spa = toc_spa + BUNDLE_TOC_HDR_SIZE;
+
+    printf("Staging bundle at SPA=0x%012llx: manifest+toc+entry=%u bytes, image=%lld bytes\n",
+           (unsigned long long)staging_spa,
+           BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + BUNDLE_TOC_ENTRY_SIZE,
+           (long long)image_size);
+
+    /* Zero the header region so unset fields don't contain stale values */
+    for (i = 0; i < hdr_words; i++) {
+        rc = write32_ioctl(fd, staging_spa + (uint64_t)i * 4, 0u);
+        if (rc) {
+            fprintf(stderr, "zero staging offset %u failed: %s\n", i * 4, strerror(-rc));
+            return rc;
+        }
+    }
+
+    /* Manifest: only payload_offset (int64 at +1160) is read by the bun2 loader */
+    rc = write32_ioctl(fd, staging_spa + BUNDLE_MANIFEST_PAYLOAD_OFF_OFF, BUNDLE_MANIFEST_SIZE);
+    if (rc) return rc;
+    /* high 32 bits = 0 (positive offset, already zeroed) */
+
+    /* TOC header */
+    rc = write32_ioctl(fd, toc_spa +  0, BUNDLE_TOC_ID);           /* toc_identifier */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, toc_spa +  4, BUNDLE_TOC_VERSION_MAJOR); /* major=1, minor=0 */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, toc_spa +  8, payload_len);              /* payload_length lo */
+    if (rc) return rc;
+    /* payload_length hi = 0 (already zeroed) */
+    rc = write32_ioctl(fd, toc_spa + 16, 1u);                       /* image_count = 1 */
+    if (rc) return rc;
+    /* image_count hi + reserved = 0 (already zeroed) */
+
+    /* TOC entry[0] */
+    rc = write32_ioctl(fd, entry_spa +  0, BUNDLE_TOC_IMG_TYPE_BL1_LO); /* type lo */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry_spa +  4, BUNDLE_TOC_IMG_TYPE_BL1_HI); /* type hi */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry_spa +  8, BUNDLE_IMG_PAYLOAD_OFFSET);  /* offset lo (from payload start) */
+    if (rc) return rc;
+    /* offset hi = 0 */
+    rc = write32_ioctl(fd, entry_spa + 16, (uint32_t)image_size);        /* length lo */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry_spa + 20, (uint32_t)((uint64_t)image_size >> 32)); /* length hi */
+    if (rc) return rc;
+    /* version at +24 = 0 */
+    rc = write32_ioctl(fd, entry_spa + 32, (uint32_t)KER_SMC_BL1_RESET_VECTOR);    /* load_addr lo */
+    if (rc) return rc;
+    /* load_addr hi = 0 */
+    rc = write32_ioctl(fd, entry_spa + 40, (uint32_t)KER_SMC_BL1_RESET_VECTOR);    /* entry_point lo */
+    if (rc) return rc;
+    /* entry_point hi = 0 */
+
+    /* Write BL1 image immediately after the TOC entry */
+    rc = load_image_to_spa(fd, bl1_path,
+                           staging_spa + BUNDLE_MANIFEST_SIZE + BUNDLE_IMG_PAYLOAD_OFFSET);
+    if (rc) return rc;
+
+    return 0;
+}
+
+static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path)
+{
+    int rc;
+    uint32_t val;
+    struct stat st;
+
+    if (stat(bl1_path, &st) < 0 || !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "cannot stat BL1 image %s: %s\n", bl1_path, strerror(errno));
+        return -errno;
+    }
+
+    /* Hold the core in reset */
+    rc = set_reset_state(fd, 0u);
+    if (rc) return rc;
+
+    /* Load BL0P5 to its execute location */
+    rc = load_image_to_spa(fd, blop5_path, local_addr_to_spa(KER_SMC_BL0P5_LOAD_ADDR));
+    if (rc) return rc;
+
+    /* Aim the reset vector at BL0P5 */
+    rc = set_reset_vector(fd, KER_SMC_BL0P5_LOAD_ADDR);
+    if (rc) return rc;
+
+    /* Release reset; BL0P5 boots and initialises the bun2 loader */
+    rc = set_reset_state(fd, 1u);
+    if (rc) return rc;
+
+    /* B) Wait for BL0P5 to signal it is ready to receive a bundle */
+    printf("Waiting for BL0P5 bundle-ready signal...\n");
+    rc = poll_scratch_eq(fd, local_addr_to_spa(KER_HOST_BOOT_STATE_LOCAL),
+                         HOST_BOOT_STATE_WAIT_FOR_BUNDLE);
+    if (rc) return rc;
+
+    /* C+D) Write bundle manifest, TOC entry, and BL1 image into the staging area */
+    rc = write_bundle_to_staging(fd, bl1_path, st.st_size);
+    if (rc) return rc;
+
+    /* Signal that the bundle is staged */
+    rc = write32_ioctl(fd, local_addr_to_spa(KER_HOST_BOOT_STATE_LOCAL),
+                       HOST_BOOT_STATE_BUNDLE_STAGED);
+    if (rc) return rc;
+
+    /* E) Wait for the bun2 loader to request validation */
+    printf("Waiting for bun2 loader validation request...\n");
+    rc = poll_scratch_bit(fd, local_addr_to_spa(KER_BUNDLE_VALIDATION_LOCAL),
+                          BUNDLE_READY_FOR_VALIDATION_BIT);
+    if (rc) return rc;
+
+    /* F) Confirm the bundle is valid */
+    rc = read32_ioctl(fd, local_addr_to_spa(KER_BUNDLE_VALIDATION_LOCAL), &val);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, local_addr_to_spa(KER_BUNDLE_VALIDATION_LOCAL),
+                       val | BUNDLE_VALIDATED_BIT);
+    if (rc) return rc;
+
+    printf("Handshake complete; BL1 at 0x%08llx should now be executing\n",
+           (unsigned long long)KER_SMC_BL1_RESET_VECTOR);
+
+    return dump_post_reset_registers(fd);
+}
+
 int main(int argc, char **argv)
 {
     char dev_path[64];
@@ -535,14 +783,16 @@ int main(int argc, char **argv)
     long dev_id = 0;
     char *endptr = NULL;
     const char *image_path = NULL;
+    const char *blop5_path = NULL;
     int image_mode = 0;
+    int blop5_mode = 0;
     int verify = 0;
     int scratch = 0;
     int bl0_mode = 0;
     int fd;
     int rc;
 
-    if (argc < 3 || argc > 5) {
+    if (argc < 3) {
         usage(argv[0]);
         return 2;
     }
@@ -550,6 +800,29 @@ int main(int argc, char **argv)
     rc = parse_mode_arg(argv[1]);
     if (rc) {
         fprintf(stderr, "Invalid mode '%s'. Expected 'k' or 'm'.\n", argv[1]);
+        usage(argv[0]);
+        return 2;
+    }
+
+    /* Pre-scan: extract --blop5 <path> before mode-specific argument parsing */
+    for (int blop5_i = 2; blop5_i < argc; blop5_i++) {
+        if (!strcmp(argv[blop5_i], "--blop5")) {
+            if (blop5_i + 1 >= argc) {
+                fprintf(stderr, "--blop5 requires a path argument\n");
+                usage(argv[0]);
+                return 2;
+            }
+            blop5_mode = 1;
+            blop5_path = argv[blop5_i + 1];
+            for (int blop5_j = blop5_i; blop5_j < argc - 2; blop5_j++) {
+                argv[blop5_j] = argv[blop5_j + 2];
+            }
+            argc -= 2;
+            break;
+        }
+    }
+
+    if (argc < 3 || argc > 5) {
         usage(argv[0]);
         return 2;
     }
@@ -622,6 +895,12 @@ int main(int argc, char **argv)
         }
     }
 
+    if (blop5_mode && !image_mode) {
+        fprintf(stderr, "--blop5 requires -i <bl1_image>\n");
+        usage(argv[0]);
+        return 2;
+    }
+
     snprintf(dev_path, sizeof(dev_path), "/dev/tenstorrent/%ld", dev_id);
     fd = open_tt_dev(dev_path, KERAUNOS_PCI_DEVICE_ID);
     if (fd < 0) {
@@ -631,6 +910,12 @@ int main(int argc, char **argv)
 
     if (bl0_mode) {
         rc = set_reset_state(fd, 0u);
+        if (rc) {
+            close(fd);
+            return 1;
+        }
+
+        rc = clear_scratch_regs(fd);
         if (rc) {
             close(fd);
             return 1;
@@ -654,40 +939,48 @@ int main(int argc, char **argv)
             return 1;
         }
     } else if (image_mode) {
-        rc = set_reset_state(fd, 0u);
-        if (rc) {
-            close(fd);
-            return 1;
-        }
+        if (blop5_mode) {
+            rc = do_blop5_boot(fd, blop5_path, image_path);
+            if (rc) {
+                close(fd);
+                return 1;
+            }
+        } else {
+            rc = set_reset_state(fd, 0u);
+            if (rc) {
+                close(fd);
+                return 1;
+            }
 
-        rc = load_image_to_smc(fd, image_path);
-        if (rc) {
-            close(fd);
-            return 1;
-        }
+            rc = load_image_to_smc(fd, image_path);
+            if (rc) {
+                close(fd);
+                return 1;
+            }
 
-        rc = verify_image_in_smc(fd, image_path);
-        if (rc) {
-            close(fd);
-            return 1;
-        }
+            rc = verify_image_in_smc(fd, image_path);
+            if (rc) {
+                close(fd);
+                return 1;
+            }
 
-        rc = set_bl1_reset_vector(fd);
-        if (rc) {
-            close(fd);
-            return 1;
-        }
+            rc = set_bl1_reset_vector(fd);
+            if (rc) {
+                close(fd);
+                return 1;
+            }
 
-        rc = set_reset_state(fd, 1u);
-        if (rc) {
-            close(fd);
-            return 1;
-        }
+            rc = set_reset_state(fd, 1u);
+            if (rc) {
+                close(fd);
+                return 1;
+            }
 
-        rc = dump_post_reset_registers(fd);
-        if (rc) {
-            close(fd);
-            return 1;
+            rc = dump_post_reset_registers(fd);
+            if (rc) {
+                close(fd);
+                return 1;
+            }
         }
     } else if (verify) {
         rc = verify_image_in_smc(fd, image_path);
