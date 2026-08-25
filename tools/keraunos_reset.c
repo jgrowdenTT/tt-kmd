@@ -56,9 +56,11 @@
 #define KER_SCRATCH_STRIDE      0x8ULL
 #define KER_SCRATCH_DUMP_COUNT  4u
 #define KER_SCRATCH_CLEAR_COUNT 16u  /* covers indices 0-15, above our highest use of [12] */
-/* BL1/Zephyr image and execution address; BL0 owns SRAM below 0xC0067000. */
+/* BL0 owns SRAM below 0xC0067000. */
 #define KER_SMC_BL1_RESET_VECTOR 0xC0067000ULL
 #define KER_SMC_BL0_RESET_VECTOR 0xC0040000ULL
+/* BL1 execute address: 128KB from the end of ram0 (0xC015b000 - 0x20000). */
+#define KER_SMC_BL1_EXEC_ADDR    0xC013B000ULL
 #define KER_SMC_SRAM_BASE 0xC0060000ULL
 #define KER_SMC_SRAM_SIZE 0x00100000ULL
 /* Bundle staging area is the upper 512KB of SRAM */
@@ -86,8 +88,9 @@
 #define BUNDLE_TOC_ENTRY_SIZE            216u
 #define BUNDLE_TOC_IMG_TYPE_BL1_LO       0x42434d53u  /* low  32b of FW_BUNDLE_IMG_TYPE_SMC_BL1 */
 #define BUNDLE_TOC_IMG_TYPE_BL1_HI       0x0000314cu  /* high 32b of FW_BUNDLE_IMG_TYPE_SMC_BL1 */
-/* Offset from payload start (= toc base) to the image data */
+/* Offset from payload start (= toc base) to image[0] in a 2-entry TOC */
 #define BUNDLE_IMG_PAYLOAD_OFFSET        (BUNDLE_TOC_HDR_SIZE + BUNDLE_TOC_ENTRY_SIZE)
+#define BUNDLE_IMG0_PAYLOAD_OFFSET       (BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE)
 #define BUNDLE_POLL_TIMEOUT_US           10000000u  /* 10 s */
 
 struct tenstorrent_get_device_info {
@@ -184,20 +187,20 @@ static void usage(const char *prog)
 {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s <k|m> <0|1> [device_id]\n", prog);
-    fprintf(stderr, "  %s <k|m> -i <bl1.bin> [device_id]\n", prog);
-    fprintf(stderr, "  %s <k|m> -i <bl1.bin> --blop5 <blop5.bin> [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m> -i <build_dir> [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m> -i <build_dir> --blop5 <blop5_build_dir> --mbl1 <mbl1_build_dir> [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> --bl0 [device_id]\n", prog);
     fprintf(stderr, "  k = SPA base 0x12020..., m = SPA base 0x13000...\n");
     fprintf(stderr, "  0 = hold SMC RISC-V in reset\n");
     fprintf(stderr, "  1 = release SMC RISC-V from reset\n");
-    fprintf(stderr, "  -i = hold reset, load image, release reset\n");
-    fprintf(stderr, "  -i + --blop5 = load blop5.bin, boot it, handshake bundle of bl1.bin\n");
+    fprintf(stderr, "  -i = hold reset, load <build_dir>/zephyr/zephyr.bin, release reset\n");
+    fprintf(stderr, "  -i + --blop5 + --mbl1 = boot blop5, handshake bundle of kbl1 + mbl1\n");
     fprintf(stderr, "  --bl0 = hold reset, wipe SRAM, set RESET_VECTOR[0] to 0xC0040000, release reset\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s k 0\n", prog);
     fprintf(stderr, "  %s k 1 3\n", prog);
-    fprintf(stderr, "  %s m -i build/zephyr/zephyr.bin\n", prog);
-    fprintf(stderr, "  %s k -i build_k/zephyr/zephyr.bin --blop5 build_blop5/zephyr/zephyr.bin\n", prog);
+    fprintf(stderr, "  %s m -i build\n", prog);
+    fprintf(stderr, "  %s k -i build_k --blop5 build_blop5 --mbl1 build_mbl1\n", prog);
 }
 
 static int parse_mode_arg(const char *arg)
@@ -637,28 +640,34 @@ static int poll_scratch_bit(int fd, uint64_t spa, uint32_t mask)
 }
 
 /*
- * Write a minimal fw_bundle_manifest + fw_bundle_toc + fw_bundle_toc_entry[0] + image
+ * Write a minimal fw_bundle_manifest + fw_bundle_toc + fw_bundle_toc_entry[0..1] + images
  * into the staging area so the bun2 loader can parse and copy it.
  *
- * Staging area layout (all offsets from KER_SMC_SRAM_BASE):
- *   [0 .. 1183]   fw_bundle_manifest  (only payload_offset at +1160 matters)
+ * Staging area layout (all offsets from staging base):
+ *   [0 .. 1183]    fw_bundle_manifest  (only payload_offset at +1160 matters)
  *   [1184 .. 1215] fw_bundle_toc header (32 bytes)
- *   [1216 .. 1431] fw_bundle_toc_entry[0] (216 bytes)
- *   [1432 .. ]    BL1 image data
+ *   [1216 .. 1431] fw_bundle_toc_entry[0]: kbl1 (216 bytes)
+ *   [1432 .. 1647] fw_bundle_toc_entry[1]: mbl1 (216 bytes)
+ *   [1648 .. ]     kbl1 image data, then mbl1 image data
  */
-static int write_bundle_to_staging(int fd, const char *bl1_path, off_t image_size)
+static int write_bundle_to_staging(int fd, const char *bl1_path, off_t image_size,
+                                   const char *mbl1_path, off_t mbl1_size)
 {
     int rc;
     uint32_t i;
-    uint64_t staging_spa = local_addr_to_spa(KER_SMC_BUNDLE_STAGING_BASE);
-    uint32_t hdr_words = (BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + BUNDLE_TOC_ENTRY_SIZE) / 4;
-    uint32_t payload_len = BUNDLE_TOC_HDR_SIZE + BUNDLE_TOC_ENTRY_SIZE + (uint32_t)image_size;
-    uint64_t toc_spa   = staging_spa + BUNDLE_MANIFEST_SIZE;
-    uint64_t entry_spa = toc_spa + BUNDLE_TOC_HDR_SIZE;
+    /* BL0P5 expects the bundle manifest at 0xC0067000. */
+    uint64_t staging_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
+    uint32_t hdr_words = (BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE) / 4;
+    uint32_t payload_len = BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE + (uint32_t)image_size
+                            + (uint32_t)mbl1_size;
+    uint64_t toc_spa    = staging_spa + BUNDLE_MANIFEST_SIZE;
+    uint64_t entry_spa  = toc_spa + BUNDLE_TOC_HDR_SIZE;
+    uint64_t entry1_spa = entry_spa + BUNDLE_TOC_ENTRY_SIZE;
+    uint64_t mbl1_offset = BUNDLE_IMG0_PAYLOAD_OFFSET + (uint64_t)image_size;
 
-    printf("Staging bundle at SPA=0x%012llx: manifest+toc+entry=%u bytes, image=%lld bytes\n",
+    printf("Staging bundle at SPA=0x%012llx: manifest+toc+entries=%u bytes, kbl1=%lld bytes\n",
            (unsigned long long)staging_spa,
-           BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + BUNDLE_TOC_ENTRY_SIZE,
+           BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE,
            (long long)image_size);
 
     /* Zero the header region so unset fields don't contain stale values */
@@ -683,7 +692,7 @@ static int write_bundle_to_staging(int fd, const char *bl1_path, off_t image_siz
     rc = write32_ioctl(fd, toc_spa +  8, payload_len);              /* payload_length lo */
     if (rc) return rc;
     /* payload_length hi = 0 (already zeroed) */
-    rc = write32_ioctl(fd, toc_spa + 16, 1u);                       /* image_count = 1 */
+    rc = write32_ioctl(fd, toc_spa + 16, 2u);                       /* image_count = 2 */
     if (rc) return rc;
     /* image_count hi + reserved = 0 (already zeroed) */
 
@@ -692,7 +701,7 @@ static int write_bundle_to_staging(int fd, const char *bl1_path, off_t image_siz
     if (rc) return rc;
     rc = write32_ioctl(fd, entry_spa +  4, BUNDLE_TOC_IMG_TYPE_BL1_HI); /* type hi */
     if (rc) return rc;
-    rc = write32_ioctl(fd, entry_spa +  8, BUNDLE_IMG_PAYLOAD_OFFSET);  /* offset lo (from payload start) */
+    rc = write32_ioctl(fd, entry_spa +  8, BUNDLE_IMG0_PAYLOAD_OFFSET); /* offset lo (from payload start) */
     if (rc) return rc;
     /* offset hi = 0 */
     rc = write32_ioctl(fd, entry_spa + 16, (uint32_t)image_size);        /* length lo */
@@ -700,29 +709,64 @@ static int write_bundle_to_staging(int fd, const char *bl1_path, off_t image_siz
     rc = write32_ioctl(fd, entry_spa + 20, (uint32_t)((uint64_t)image_size >> 32)); /* length hi */
     if (rc) return rc;
     /* version at +24 = 0 */
-    rc = write32_ioctl(fd, entry_spa + 32, (uint32_t)KER_SMC_BL1_RESET_VECTOR);    /* load_addr lo */
+    rc = write32_ioctl(fd, entry_spa + 32, (uint32_t)KER_SMC_BL1_EXEC_ADDR);       /* load_addr lo */
     if (rc) return rc;
     /* load_addr hi = 0 */
-    rc = write32_ioctl(fd, entry_spa + 40, (uint32_t)KER_SMC_BL1_RESET_VECTOR);    /* entry_point lo */
+    rc = write32_ioctl(fd, entry_spa + 40, (uint32_t)KER_SMC_BL1_EXEC_ADDR);       /* entry_point lo */
     if (rc) return rc;
     /* entry_point hi = 0 */
 
-    /* Write BL1 image immediately after the TOC entry */
-    rc = load_image_to_spa(fd, bl1_path,
-                           staging_spa + BUNDLE_MANIFEST_SIZE + BUNDLE_IMG_PAYLOAD_OFFSET);
+    /* TOC entry[1]: mbl1 (image data follows kbl1) */
+    rc = write32_ioctl(fd, entry1_spa +  0, BUNDLE_TOC_IMG_TYPE_BL1_LO); /* type lo */
     if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa +  4, BUNDLE_TOC_IMG_TYPE_BL1_HI); /* type hi */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa +  8, (uint32_t)mbl1_offset);      /* offset lo */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa + 12, (uint32_t)(mbl1_offset >> 32)); /* offset hi */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa + 16, (uint32_t)mbl1_size);           /* length lo */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa + 20, (uint32_t)((uint64_t)mbl1_size >> 32)); /* length hi */
+    if (rc) return rc;
+    /* version at +24 = 0 */
+    rc = write32_ioctl(fd, entry1_spa + 32, (uint32_t)KER_SMC_BL1_EXEC_ADDR); /* load_addr lo */
+    if (rc) return rc;
+    /* load_addr hi = 0 */
+    rc = write32_ioctl(fd, entry1_spa + 40, (uint32_t)KER_SMC_BL1_EXEC_ADDR); /* entry_point lo */
+    if (rc) return rc;
+    /* entry_point hi = 0 */
+
+    /* Write kbl1 image after both TOC entries */
+    rc = load_image_to_spa(fd, bl1_path,
+                           staging_spa + BUNDLE_MANIFEST_SIZE + BUNDLE_IMG0_PAYLOAD_OFFSET);
+    if (rc) return rc;
+
+    /* Write mbl1 image immediately after kbl1 */
+    if (mbl1_path) {
+        rc = load_image_to_spa(fd, mbl1_path,
+                               staging_spa + BUNDLE_MANIFEST_SIZE + mbl1_offset);
+        if (rc) return rc;
+    }
 
     return 0;
 }
 
-static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path)
+static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
+                         const char *mbl1_path)
 {
     int rc;
     uint32_t val;
     struct stat st;
+    struct stat mbl1_st = {0};
 
     if (stat(bl1_path, &st) < 0 || !S_ISREG(st.st_mode)) {
         fprintf(stderr, "cannot stat BL1 image %s: %s\n", bl1_path, strerror(errno));
+        return -errno;
+    }
+
+    if (mbl1_path && (stat(mbl1_path, &mbl1_st) < 0 || !S_ISREG(mbl1_st.st_mode))) {
+        fprintf(stderr, "cannot stat mbl1 image %s: %s\n", mbl1_path, strerror(errno));
         return -errno;
     }
 
@@ -748,8 +792,9 @@ static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path)
                          HOST_BOOT_STATE_WAIT_FOR_BUNDLE);
     if (rc) return rc;
 
-    /* C+D) Write bundle manifest, TOC entry, and BL1 image into the staging area */
-    rc = write_bundle_to_staging(fd, bl1_path, st.st_size);
+    /* C+D) Write bundle manifest, TOC entries, and images into the staging area */
+    rc = write_bundle_to_staging(fd, bl1_path, st.st_size,
+                                 mbl1_path, mbl1_path ? mbl1_st.st_size : 0);
     if (rc) return rc;
 
     /* Signal that the bundle is staged */
@@ -771,9 +816,22 @@ static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path)
     if (rc) return rc;
 
     printf("Handshake complete; BL1 at 0x%08llx should now be executing\n",
-           (unsigned long long)KER_SMC_BL1_RESET_VECTOR);
+           (unsigned long long)KER_SMC_BL1_EXEC_ADDR);
 
     return dump_post_reset_registers(fd);
+}
+
+static char *make_image_path(const char *build_dir)
+{
+    size_t len = strlen(build_dir) + sizeof("/zephyr/zephyr.bin");
+    char *path = malloc(len);
+
+    if (!path) {
+        fprintf(stderr, "out of memory\n");
+        return NULL;
+    }
+    snprintf(path, len, "%s/zephyr/zephyr.bin", build_dir);
+    return path;
 }
 
 int main(int argc, char **argv)
@@ -782,8 +840,9 @@ int main(int argc, char **argv)
     long reset_state = -1;
     long dev_id = 0;
     char *endptr = NULL;
-    const char *image_path = NULL;
-    const char *blop5_path = NULL;
+    char *image_path = NULL;
+    char *blop5_path = NULL;
+    char *mbl1_path = NULL;
     int image_mode = 0;
     int blop5_mode = 0;
     int verify = 0;
@@ -816,6 +875,23 @@ int main(int argc, char **argv)
             blop5_path = argv[blop5_i + 1];
             for (int blop5_j = blop5_i; blop5_j < argc - 2; blop5_j++) {
                 argv[blop5_j] = argv[blop5_j + 2];
+            }
+            argc -= 2;
+            break;
+        }
+    }
+
+    /* Pre-scan: extract --mbl1 <path> before mode-specific argument parsing */
+    for (int mbl1_i = 2; mbl1_i < argc; mbl1_i++) {
+        if (!strcmp(argv[mbl1_i], "--mbl1")) {
+            if (mbl1_i + 1 >= argc) {
+                fprintf(stderr, "--mbl1 requires a path argument\n");
+                usage(argv[0]);
+                return 2;
+            }
+            mbl1_path = argv[mbl1_i + 1];
+            for (int mbl1_j = mbl1_i; mbl1_j < argc - 2; mbl1_j++) {
+                argv[mbl1_j] = argv[mbl1_j + 2];
             }
             argc -= 2;
             break;
@@ -896,9 +972,31 @@ int main(int argc, char **argv)
     }
 
     if (blop5_mode && !image_mode) {
-        fprintf(stderr, "--blop5 requires -i <bl1_image>\n");
+        fprintf(stderr, "--blop5 requires -i <kbl1_build_dir>\n");
         usage(argv[0]);
         return 2;
+    }
+
+    if (blop5_mode && !mbl1_path) {
+        fprintf(stderr, "--blop5 requires --mbl1 <mbl1_build_dir>\n");
+        usage(argv[0]);
+        return 2;
+    }
+
+    if (image_path) {
+        char *p = make_image_path(image_path);
+        if (!p) return 1;
+        image_path = p;
+    }
+    if (blop5_path) {
+        char *p = make_image_path(blop5_path);
+        if (!p) return 1;
+        blop5_path = p;
+    }
+    if (mbl1_path) {
+        char *p = make_image_path(mbl1_path);
+        if (!p) return 1;
+        mbl1_path = p;
     }
 
     snprintf(dev_path, sizeof(dev_path), "/dev/tenstorrent/%ld", dev_id);
@@ -940,7 +1038,7 @@ int main(int argc, char **argv)
         }
     } else if (image_mode) {
         if (blop5_mode) {
-            rc = do_blop5_boot(fd, blop5_path, image_path);
+            rc = do_blop5_boot(fd, blop5_path, image_path, mbl1_path);
             if (rc) {
                 close(fd);
                 return 1;
