@@ -70,6 +70,8 @@
 
 /* BL0P5 execute location: 64KB from end of ram0 (0xC0160000 - 0x10000) */
 #define KER_SMC_BL0P5_LOAD_ADDR         0xC0150000ULL
+#define KER_SMC_KMIS_LOAD_ADDR          0xC0067000ULL
+#define MIMIR_SMC_MIS_LOAD_ADDR         0x1300067000ULL
 /* Scratch registers used for the BL0P5 <-> host handshake (local addresses) */
 #define KER_HOST_BOOT_STATE_LOCAL        0xC0010160ULL  /* SCRATCH[12] */
 #define KER_BUNDLE_VALIDATION_LOCAL      0xC0010150ULL  /* SCRATCH[10] */
@@ -88,9 +90,12 @@
 #define BUNDLE_TOC_ENTRY_SIZE            216u
 #define BUNDLE_TOC_IMG_TYPE_BL1_LO       0x42434d53u  /* low  32b of FW_BUNDLE_IMG_TYPE_SMC_BL1 */
 #define BUNDLE_TOC_IMG_TYPE_BL1_HI       0x0000314cu  /* high 32b of FW_BUNDLE_IMG_TYPE_SMC_BL1 */
+#define BUNDLE_TOC_IMG_TYPE_MIS_LO       0x42434d53u  /* low  32b of FW_BUNDLE_IMG_TYPE_SMC_MIS */
+#define BUNDLE_TOC_IMG_TYPE_MIS_HI       0x0000324cu  /* high 32b of FW_BUNDLE_IMG_TYPE_SMC_MIS */
 /* Offset from payload start (= toc base) to image[0] in a 2-entry TOC */
 #define BUNDLE_IMG_PAYLOAD_OFFSET        (BUNDLE_TOC_HDR_SIZE + BUNDLE_TOC_ENTRY_SIZE)
 #define BUNDLE_IMG0_PAYLOAD_OFFSET       (BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE)
+#define BUN3_PAYLOAD_OFFSET              (KER_SMC_KMIS_LOAD_ADDR - KER_SMC_BL1_RESET_VECTOR - BUNDLE_IMG0_PAYLOAD_OFFSET)
 #define BUNDLE_POLL_TIMEOUT_US           10000000u  /* 10 s */
 
 struct tenstorrent_get_device_info {
@@ -188,19 +193,19 @@ static void usage(const char *prog)
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s <k|m> <0|1> [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> --kbl1 <build_dir> [device_id]\n", prog);
-    fprintf(stderr, "  %s <k|m> --kbl1 <build_dir> --blop5 <blop5_build_dir> --mbl1 <mbl1_build_dir> [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m> --kbl1 <build_dir> --blop5 <blop5_build_dir> --mbl1 <mbl1_build_dir> --kmis <kmis_build_dir> --mmis <mmis_build_dir> [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> --bl0 [device_id]\n", prog);
     fprintf(stderr, "  k = SPA base 0x12020..., m = SPA base 0x13000...\n");
     fprintf(stderr, "  0 = hold SMC RISC-V in reset\n");
     fprintf(stderr, "  1 = release SMC RISC-V from reset\n");
     fprintf(stderr, "  --kbl1 = hold reset, load <build_dir>/zephyr/zephyr.bin, release reset\n");
-    fprintf(stderr, "  --kbl1 + --blop5 + --mbl1 = boot blop5, handshake bundle of kbl1 + mbl1\n");
+    fprintf(stderr, "  --kbl1 + --blop5 + --mbl1 + --kmis + --mmis = boot blop5 with BL1 and MIS images\n");
     fprintf(stderr, "  --bl0 = hold reset, wipe SRAM, set RESET_VECTOR[0] to 0xC0040000, release reset\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s k 0\n", prog);
     fprintf(stderr, "  %s k 1 3\n", prog);
     fprintf(stderr, "  %s m --kbl1 build\n", prog);
-    fprintf(stderr, "  %s k --kbl1 build_k --blop5 build_blop5 --mbl1 build_mbl1\n", prog);
+    fprintf(stderr, "  %s k --kbl1 build_k --blop5 build_blop5 --mbl1 build_mbl1 --kmis build_kmis --mmis build_mmis\n", prog);
 }
 
 static int parse_mode_arg(const char *arg)
@@ -752,13 +757,103 @@ static int write_bundle_to_staging(int fd, const char *bl1_path, off_t image_siz
     return 0;
 }
 
+static int write_mis_bundle_to_staging(int fd, const char *kmis_path, off_t kmis_size,
+                                       const char *mmis_path, off_t mmis_size)
+{
+    int rc;
+    uint32_t i;
+    uint64_t staging_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
+    uint64_t toc_spa = staging_spa + BUN3_PAYLOAD_OFFSET;
+    uint64_t entry_spa = toc_spa + BUNDLE_TOC_HDR_SIZE;
+    uint64_t entry1_spa = entry_spa + BUNDLE_TOC_ENTRY_SIZE;
+    uint64_t mmis_offset = BUNDLE_IMG0_PAYLOAD_OFFSET +
+                           (((uint64_t)kmis_size + 7u) & ~7u);
+    uint32_t header_words = (BUN3_PAYLOAD_OFFSET + BUNDLE_TOC_HDR_SIZE +
+                             2u * BUNDLE_TOC_ENTRY_SIZE) / 4u;
+    uint32_t payload_len = BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE +
+                           (uint32_t)mmis_offset + (uint32_t)mmis_size;
+
+    printf("Staging BUN3 at SPA=0x%012llx with K-MIS at local=0x%08llx\n",
+           (unsigned long long)staging_spa,
+           (unsigned long long)KER_SMC_KMIS_LOAD_ADDR);
+
+    for (i = 0; i < header_words; i++) {
+        rc = write32_ioctl(fd, staging_spa + (uint64_t)i * 4u, 0u);
+        if (rc) {
+            fprintf(stderr, "zero BUN3 header offset %u failed: %s\n", i * 4u,
+                    strerror(-rc));
+            return rc;
+        }
+    }
+
+    rc = write32_ioctl(fd, staging_spa + BUNDLE_MANIFEST_PAYLOAD_OFF_OFF,
+                       BUN3_PAYLOAD_OFFSET);
+    if (rc) return rc;
+
+    rc = write32_ioctl(fd, toc_spa + 0, BUNDLE_TOC_ID);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, toc_spa + 4, BUNDLE_TOC_VERSION_MAJOR);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, toc_spa + 8, payload_len);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, toc_spa + 16, 2u);
+    if (rc) return rc;
+
+    /* TOC entry[0]: K-MIS is already in place at its linked address. */
+    rc = write32_ioctl(fd, entry_spa + 0, BUNDLE_TOC_IMG_TYPE_MIS_LO);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry_spa + 4, BUNDLE_TOC_IMG_TYPE_MIS_HI);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry_spa + 8, BUNDLE_IMG0_PAYLOAD_OFFSET);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry_spa + 16, (uint32_t)kmis_size);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry_spa + 20, (uint32_t)((uint64_t)kmis_size >> 32));
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry_spa + 32, (uint32_t)KER_SMC_KMIS_LOAD_ADDR);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry_spa + 40, (uint32_t)KER_SMC_KMIS_LOAD_ADDR);
+    if (rc) return rc;
+
+    /* TOC entry[1]: M-MIS is copied to Mimir by K-MIS. */
+    rc = write32_ioctl(fd, entry1_spa + 0, BUNDLE_TOC_IMG_TYPE_MIS_LO);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa + 4, BUNDLE_TOC_IMG_TYPE_MIS_HI);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa + 8, (uint32_t)mmis_offset);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa + 12, (uint32_t)(mmis_offset >> 32));
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa + 16, (uint32_t)mmis_size);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa + 20, (uint32_t)((uint64_t)mmis_size >> 32));
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa + 32, (uint32_t)MIMIR_SMC_MIS_LOAD_ADDR);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa + 36,
+                       (uint32_t)(MIMIR_SMC_MIS_LOAD_ADDR >> 32));
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry1_spa + 40, (uint32_t)KER_SMC_KMIS_LOAD_ADDR);
+    if (rc) return rc;
+
+    rc = load_image_to_spa(fd, kmis_path,
+                           staging_spa + BUN3_PAYLOAD_OFFSET + BUNDLE_IMG0_PAYLOAD_OFFSET);
+    if (rc) return rc;
+
+    return load_image_to_spa(fd, mmis_path,
+                             staging_spa + BUN3_PAYLOAD_OFFSET + mmis_offset);
+}
+
 static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
-                         const char *mbl1_path)
+                         const char *mbl1_path, const char *kmis_path,
+                         const char *mmis_path)
 {
     int rc;
     uint32_t val;
     struct stat st;
     struct stat mbl1_st = {0};
+    struct stat kmis_st = {0};
+    struct stat mmis_st = {0};
 
     if (stat(bl1_path, &st) < 0 || !S_ISREG(st.st_mode)) {
         fprintf(stderr, "cannot stat BL1 image %s: %s\n", bl1_path, strerror(errno));
@@ -767,6 +862,16 @@ static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
 
     if (mbl1_path && (stat(mbl1_path, &mbl1_st) < 0 || !S_ISREG(mbl1_st.st_mode))) {
         fprintf(stderr, "cannot stat mbl1 image %s: %s\n", mbl1_path, strerror(errno));
+        return -errno;
+    }
+
+    if (stat(kmis_path, &kmis_st) < 0 || !S_ISREG(kmis_st.st_mode)) {
+        fprintf(stderr, "cannot stat kmis image %s: %s\n", kmis_path, strerror(errno));
+        return -errno;
+    }
+
+    if (stat(mmis_path, &mmis_st) < 0 || !S_ISREG(mmis_st.st_mode)) {
+        fprintf(stderr, "cannot stat mmis image %s: %s\n", mmis_path, strerror(errno));
         return -errno;
     }
 
@@ -815,8 +920,33 @@ static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
                        val | BUNDLE_VALIDATED_BIT);
     if (rc) return rc;
 
-    printf("Handshake complete; BL1 at 0x%08llx should now be executing\n",
-           (unsigned long long)KER_SMC_BL1_EXEC_ADDR);
+    /* K-MIS signals that it is ready for the next host bundle handshake. */
+    printf("Waiting for K-MIS bundle-ready signal...\n");
+    rc = poll_scratch_eq(fd, local_addr_to_spa(KER_HOST_BOOT_STATE_LOCAL),
+                         HOST_BOOT_STATE_WAIT_FOR_BUNDLE);
+    if (rc) return rc;
+
+    /* BUN2 is consumed; reuse its staging area for the BUN3 MIS bundle. */
+    rc = write_mis_bundle_to_staging(fd, kmis_path, kmis_st.st_size,
+                                     mmis_path, mmis_st.st_size);
+    if (rc) return rc;
+
+    rc = write32_ioctl(fd, local_addr_to_spa(KER_HOST_BOOT_STATE_LOCAL),
+                       HOST_BOOT_STATE_BUNDLE_STAGED);
+    if (rc) return rc;
+
+    printf("Waiting for BUN3 validation request...\n");
+    rc = poll_scratch_bit(fd, local_addr_to_spa(KER_BUNDLE_VALIDATION_LOCAL),
+                          BUNDLE_READY_FOR_VALIDATION_BIT);
+    if (rc) return rc;
+
+    rc = read32_ioctl(fd, local_addr_to_spa(KER_BUNDLE_VALIDATION_LOCAL), &val);
+    if (rc) return rc;
+    rc = write32_ioctl(fd, local_addr_to_spa(KER_BUNDLE_VALIDATION_LOCAL),
+                       val | BUNDLE_VALIDATED_BIT);
+    if (rc) return rc;
+
+    printf("Handshake complete; MIS at should now be executing\n");
 
     return dump_post_reset_registers(fd);
 }
@@ -843,6 +973,8 @@ int main(int argc, char **argv)
     char *image_path = NULL;
     char *blop5_path = NULL;
     char *mbl1_path = NULL;
+    char *kmis_path = NULL;
+    char *mmis_path = NULL;
     int image_mode = 0;
     int blop5_mode = 0;
     int verify = 0;
@@ -892,6 +1024,40 @@ int main(int argc, char **argv)
             mbl1_path = argv[mbl1_i + 1];
             for (int mbl1_j = mbl1_i; mbl1_j < argc - 2; mbl1_j++) {
                 argv[mbl1_j] = argv[mbl1_j + 2];
+            }
+            argc -= 2;
+            break;
+        }
+    }
+
+    /* Pre-scan: extract --kmis <path> before mode-specific argument parsing */
+    for (int kmis_i = 2; kmis_i < argc; kmis_i++) {
+        if (!strcmp(argv[kmis_i], "--kmis")) {
+            if (kmis_i + 1 >= argc) {
+                fprintf(stderr, "--kmis requires a path argument\n");
+                usage(argv[0]);
+                return 2;
+            }
+            kmis_path = argv[kmis_i + 1];
+            for (int kmis_j = kmis_i; kmis_j < argc - 2; kmis_j++) {
+                argv[kmis_j] = argv[kmis_j + 2];
+            }
+            argc -= 2;
+            break;
+        }
+    }
+
+    /* Pre-scan: extract --mmis <path> before mode-specific argument parsing */
+    for (int mmis_i = 2; mmis_i < argc; mmis_i++) {
+        if (!strcmp(argv[mmis_i], "--mmis")) {
+            if (mmis_i + 1 >= argc) {
+                fprintf(stderr, "--mmis requires a path argument\n");
+                usage(argv[0]);
+                return 2;
+            }
+            mmis_path = argv[mmis_i + 1];
+            for (int mmis_j = mmis_i; mmis_j < argc - 2; mmis_j++) {
+                argv[mmis_j] = argv[mmis_j + 2];
             }
             argc -= 2;
             break;
@@ -988,6 +1154,18 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    if (blop5_mode && !kmis_path) {
+        fprintf(stderr, "--blop5 requires --kmis <kmis_build_dir>\n");
+        usage(argv[0]);
+        return 2;
+    }
+
+    if (blop5_mode && !mmis_path) {
+        fprintf(stderr, "--blop5 requires --mmis <mmis_build_dir>\n");
+        usage(argv[0]);
+        return 2;
+    }
+
     if (image_path) {
         char *p = make_image_path(image_path);
         if (!p) return 1;
@@ -1002,6 +1180,16 @@ int main(int argc, char **argv)
         char *p = make_image_path(mbl1_path);
         if (!p) return 1;
         mbl1_path = p;
+    }
+    if (kmis_path) {
+        char *p = make_image_path(kmis_path);
+        if (!p) return 1;
+        kmis_path = p;
+    }
+    if (mmis_path) {
+        char *p = make_image_path(mmis_path);
+        if (!p) return 1;
+        mmis_path = p;
     }
 
     snprintf(dev_path, sizeof(dev_path), "/dev/tenstorrent/%ld", dev_id);
@@ -1043,7 +1231,7 @@ int main(int argc, char **argv)
         }
     } else if (image_mode) {
         if (blop5_mode) {
-            rc = do_blop5_boot(fd, blop5_path, image_path, mbl1_path);
+            rc = do_blop5_boot(fd, blop5_path, image_path, mbl1_path, kmis_path, mmis_path);
             if (rc) {
                 close(fd);
                 return 1;
