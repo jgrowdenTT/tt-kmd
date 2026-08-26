@@ -191,21 +191,22 @@ static int open_tt_dev(const char *path, uint16_t expected_device_id)
 static void usage(const char *prog)
 {
     fprintf(stderr, "Usage:\n");
+    fprintf(stderr, "  %s --sysbuild <sysbuild_dir> [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> <0|1> [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> --kbl1 <build_dir> [device_id]\n", prog);
-    fprintf(stderr, "  %s <k|m> --kbl1 <build_dir> --blop5 <blop5_build_dir> --mbl1 <mbl1_build_dir> --kmis <kmis_build_dir> --mmis <mmis_build_dir> [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m> --blop5 --sysbuild <sysbuild_dir> [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> --bl0 [device_id]\n", prog);
     fprintf(stderr, "  k = SPA base 0x12020..., m = SPA base 0x13000...\n");
     fprintf(stderr, "  0 = hold SMC RISC-V in reset\n");
     fprintf(stderr, "  1 = release SMC RISC-V from reset\n");
     fprintf(stderr, "  --kbl1 = hold reset, load <build_dir>/zephyr/zephyr.bin, release reset\n");
-    fprintf(stderr, "  --kbl1 + --blop5 + --mbl1 + --kmis + --mmis = boot blop5 with BL1 and MIS images\n");
+    fprintf(stderr, "  --blop5 --sysbuild = boot blop5 using all images from a sysbuild directory\n");
     fprintf(stderr, "  --bl0 = hold reset, wipe SRAM, set RESET_VECTOR[0] to 0xC0040000, release reset\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s k 0\n", prog);
     fprintf(stderr, "  %s k 1 3\n", prog);
     fprintf(stderr, "  %s m --kbl1 build\n", prog);
-    fprintf(stderr, "  %s k --kbl1 build_k --blop5 build_blop5 --mbl1 build_mbl1 --kmis build_kmis --mmis build_mmis\n", prog);
+    fprintf(stderr, "  %s k --blop5 --sysbuild build\n", prog);
 }
 
 static int parse_mode_arg(const char *arg)
@@ -345,6 +346,27 @@ static int clear_scratch_regs(int fd)
         }
     }
     return 0;
+}
+
+static int set_reset_state(int fd, uint32_t requested_state);
+
+static int do_bl0_boot(int fd)
+{
+    int rc;
+
+    rc = set_reset_state(fd, 0u);
+    if (rc) return rc;
+
+    rc = clear_scratch_regs(fd);
+    if (rc) return rc;
+
+    rc = wipe_smc_sram(fd);
+    if (rc) return rc;
+
+    rc = set_reset_vector(fd, KER_SMC_BL0_RESET_VECTOR);
+    if (rc) return rc;
+
+    return set_reset_state(fd, 1u);
 }
 
 static int set_reset_state(int fd, uint32_t requested_state)
@@ -964,6 +986,20 @@ static char *make_image_path(const char *build_dir)
     return path;
 }
 
+static char *make_image_path_from_sysbuild(const char *sysbuild_dir, const char *image_name)
+{
+    const char *suffix = "/zephyr/zephyr.bin";
+    size_t len = strlen(sysbuild_dir) + 1 + strlen(image_name) + strlen(suffix) + 1;
+    char *path = malloc(len);
+
+    if (!path) {
+        fprintf(stderr, "out of memory\n");
+        return NULL;
+    }
+    snprintf(path, len, "%s/%s%s", sysbuild_dir, image_name, suffix);
+    return path;
+}
+
 int main(int argc, char **argv)
 {
     char dev_path[64];
@@ -975,11 +1011,13 @@ int main(int argc, char **argv)
     char *mbl1_path = NULL;
     char *kmis_path = NULL;
     char *mmis_path = NULL;
+    char *sysbuild_path = NULL;
     int image_mode = 0;
     int blop5_mode = 0;
     int verify = 0;
     int scratch = 0;
     int bl0_mode = 0;
+    int direct_sysbuild_mode = 0;
     int fd;
     int rc;
 
@@ -988,88 +1026,69 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    rc = parse_mode_arg(argv[1]);
-    if (rc) {
+    direct_sysbuild_mode = !strcmp(argv[1], "--sysbuild");
+    if (direct_sysbuild_mode) {
+        blop5_mode = 1;
+    } else {
+        rc = parse_mode_arg(argv[1]);
+    }
+    if (!direct_sysbuild_mode && rc) {
         fprintf(stderr, "Invalid mode '%s'. Expected 'k' or 'm'.\n", argv[1]);
         usage(argv[0]);
         return 2;
     }
 
-    /* Pre-scan: extract --blop5 <path> before mode-specific argument parsing */
+    /* Pre-scan: extract --blop5 before mode-specific argument parsing */
     for (int blop5_i = 2; blop5_i < argc; blop5_i++) {
         if (!strcmp(argv[blop5_i], "--blop5")) {
-            if (blop5_i + 1 >= argc) {
-                fprintf(stderr, "--blop5 requires a path argument\n");
-                usage(argv[0]);
-                return 2;
-            }
             blop5_mode = 1;
-            blop5_path = argv[blop5_i + 1];
-            for (int blop5_j = blop5_i; blop5_j < argc - 2; blop5_j++) {
-                argv[blop5_j] = argv[blop5_j + 2];
+            for (int blop5_j = blop5_i; blop5_j < argc - 1; blop5_j++) {
+                argv[blop5_j] = argv[blop5_j + 1];
             }
-            argc -= 2;
+            argc -= 1;
             break;
         }
     }
 
-    /* Pre-scan: extract --mbl1 <path> before mode-specific argument parsing */
-    for (int mbl1_i = 2; mbl1_i < argc; mbl1_i++) {
-        if (!strcmp(argv[mbl1_i], "--mbl1")) {
-            if (mbl1_i + 1 >= argc) {
-                fprintf(stderr, "--mbl1 requires a path argument\n");
+    /* Pre-scan: extract --sysbuild <path> before mode-specific argument parsing */
+    for (int sysbuild_i = direct_sysbuild_mode ? 1 : 2; sysbuild_i < argc; sysbuild_i++) {
+        if (!strcmp(argv[sysbuild_i], "--sysbuild")) {
+            if (sysbuild_i + 1 >= argc) {
+                fprintf(stderr, "--sysbuild requires a path argument\n");
                 usage(argv[0]);
                 return 2;
             }
-            mbl1_path = argv[mbl1_i + 1];
-            for (int mbl1_j = mbl1_i; mbl1_j < argc - 2; mbl1_j++) {
-                argv[mbl1_j] = argv[mbl1_j + 2];
+            sysbuild_path = argv[sysbuild_i + 1];
+            for (int sysbuild_j = sysbuild_i; sysbuild_j < argc - 2; sysbuild_j++) {
+                argv[sysbuild_j] = argv[sysbuild_j + 2];
             }
             argc -= 2;
             break;
         }
     }
 
-    /* Pre-scan: extract --kmis <path> before mode-specific argument parsing */
-    for (int kmis_i = 2; kmis_i < argc; kmis_i++) {
-        if (!strcmp(argv[kmis_i], "--kmis")) {
-            if (kmis_i + 1 >= argc) {
-                fprintf(stderr, "--kmis requires a path argument\n");
-                usage(argv[0]);
-                return 2;
-            }
-            kmis_path = argv[kmis_i + 1];
-            for (int kmis_j = kmis_i; kmis_j < argc - 2; kmis_j++) {
-                argv[kmis_j] = argv[kmis_j + 2];
-            }
-            argc -= 2;
-            break;
-        }
-    }
-
-    /* Pre-scan: extract --mmis <path> before mode-specific argument parsing */
-    for (int mmis_i = 2; mmis_i < argc; mmis_i++) {
-        if (!strcmp(argv[mmis_i], "--mmis")) {
-            if (mmis_i + 1 >= argc) {
-                fprintf(stderr, "--mmis requires a path argument\n");
-                usage(argv[0]);
-                return 2;
-            }
-            mmis_path = argv[mmis_i + 1];
-            for (int mmis_j = mmis_i; mmis_j < argc - 2; mmis_j++) {
-                argv[mmis_j] = argv[mmis_j + 2];
-            }
-            argc -= 2;
-            break;
-        }
-    }
-
-    if (argc < 3 || argc > 5) {
+    if ((!direct_sysbuild_mode && argc < 2) || argc > 4) {
         usage(argv[0]);
         return 2;
     }
 
-    if (!strcmp(argv[2], "--bl0")) {
+    if (blop5_mode) {
+        image_mode = 1;
+        int first_device_arg = direct_sysbuild_mode ? 1 : 2;
+        int expected_argc = direct_sysbuild_mode ? 1 : 2;
+        if (argc != expected_argc && argc != expected_argc + 1) {
+            usage(argv[0]);
+            return 2;
+        }
+        if (argc == expected_argc + 1) {
+            endptr = NULL;
+            dev_id = strtol(argv[first_device_arg], &endptr, 0);
+            if (endptr == argv[first_device_arg] || *endptr != '\0' || dev_id < 0 || dev_id > 255) {
+                fprintf(stderr, "Invalid device_id: %s\n", argv[first_device_arg]);
+                return 2;
+            }
+        }
+    } else if (!strcmp(argv[2], "--bl0")) {
         bl0_mode = 1;
         if (argc != 3 && argc != 4) {
             usage(argv[0]);
@@ -1142,26 +1161,8 @@ int main(int argc, char **argv)
         }
     }
 
-    if (blop5_mode && !image_mode) {
-        fprintf(stderr, "--blop5 requires --kbl1 <kbl1_build_dir>\n");
-        usage(argv[0]);
-        return 2;
-    }
-
-    if (blop5_mode && !mbl1_path) {
-        fprintf(stderr, "--blop5 requires --mbl1 <mbl1_build_dir>\n");
-        usage(argv[0]);
-        return 2;
-    }
-
-    if (blop5_mode && !kmis_path) {
-        fprintf(stderr, "--blop5 requires --kmis <kmis_build_dir>\n");
-        usage(argv[0]);
-        return 2;
-    }
-
-    if (blop5_mode && !mmis_path) {
-        fprintf(stderr, "--blop5 requires --mmis <mmis_build_dir>\n");
+    if (blop5_mode && !sysbuild_path) {
+        fprintf(stderr, "--blop5 requires --sysbuild <sysbuild_dir>\n");
         usage(argv[0]);
         return 2;
     }
@@ -1171,25 +1172,13 @@ int main(int argc, char **argv)
         if (!p) return 1;
         image_path = p;
     }
-    if (blop5_path) {
-        char *p = make_image_path(blop5_path);
-        if (!p) return 1;
-        blop5_path = p;
-    }
-    if (mbl1_path) {
-        char *p = make_image_path(mbl1_path);
-        if (!p) return 1;
-        mbl1_path = p;
-    }
-    if (kmis_path) {
-        char *p = make_image_path(kmis_path);
-        if (!p) return 1;
-        kmis_path = p;
-    }
-    if (mmis_path) {
-        char *p = make_image_path(mmis_path);
-        if (!p) return 1;
-        mmis_path = p;
+    if (blop5_mode) {
+        blop5_path = make_image_path_from_sysbuild(sysbuild_path, "bl0p5_keraunos");
+        image_path = make_image_path_from_sysbuild(sysbuild_path, "bl1_keraunos");
+        mbl1_path = make_image_path_from_sysbuild(sysbuild_path, "bl1_mimir");
+        kmis_path = make_image_path_from_sysbuild(sysbuild_path, "mis");
+        mmis_path = make_image_path_from_sysbuild(sysbuild_path, "mis_mimir");
+        if (!blop5_path || !image_path || !mbl1_path || !kmis_path || !mmis_path) return 1;
     }
 
     snprintf(dev_path, sizeof(dev_path), "/dev/tenstorrent/%ld", dev_id);
@@ -1199,32 +1188,22 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (bl0_mode) {
-        rc = set_reset_state(fd, 0u);
+    if (direct_sysbuild_mode) {
+        g_spa_base = KER_SPA_BASE_M;
+        rc = do_bl0_boot(fd);
         if (rc) {
             close(fd);
             return 1;
         }
 
-        rc = clear_scratch_regs(fd);
+        g_spa_base = KER_SPA_BASE_K;
+        rc = do_bl0_boot(fd);
         if (rc) {
             close(fd);
             return 1;
         }
 
-        rc = wipe_smc_sram(fd);
-        if (rc) {
-            close(fd);
-            return 1;
-        }
-
-        rc = set_reset_vector(fd, KER_SMC_BL0_RESET_VECTOR);
-        if (rc) {
-            close(fd);
-            return 1;
-        }
-
-        rc = set_reset_state(fd, 1u);
+        rc = do_blop5_boot(fd, blop5_path, image_path, mbl1_path, kmis_path, mmis_path);
         if (rc) {
             close(fd);
             return 1;
@@ -1272,6 +1251,12 @@ int main(int argc, char **argv)
                 close(fd);
                 return 1;
             }
+        }
+    } else if (bl0_mode) {
+        rc = do_bl0_boot(fd);
+        if (rc) {
+            close(fd);
+            return 1;
         }
     } else if (verify) {
         rc = verify_image_in_smc(fd, image_path);
