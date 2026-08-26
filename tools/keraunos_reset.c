@@ -6,7 +6,7 @@
 // Behavior:
 //   keraunos_reset 0 -> hold SMC RISC-V core in reset
 //   keraunos_reset 1 -> release SMC RISC-V core from reset
-//   keraunos_reset -i <image.bin> -> hold reset, load image, release reset
+//   keraunos_reset --kbl1 <image.bin> -> hold reset, load image, release reset
 //
 // Addressing:
 //   SMC_CPU_SMC_CPU_CTRL_RESET_CTRL_REG_ADDR
@@ -56,8 +56,8 @@
 #define KER_SCRATCH_STRIDE      0x8ULL
 #define KER_SCRATCH_DUMP_COUNT  4u
 #define KER_SCRATCH_CLEAR_COUNT 16u  /* covers indices 0-15, above our highest use of [12] */
-/* BL0 owns SRAM below 0xC0067000. */
-#define KER_SMC_BL1_RESET_VECTOR 0xC0067000ULL
+/* BL0 owns SRAM below 0xC0066400. */
+#define KER_SMC_BL1_RESET_VECTOR 0xC0066400ULL
 #define KER_SMC_BL0_RESET_VECTOR 0xC0040000ULL
 /* BL1 execute address: 128KB from the end of ram0 (0xC015b000 - 0x20000). */
 #define KER_SMC_BL1_EXEC_ADDR    0xC013B000ULL
@@ -68,8 +68,8 @@
 /* KeraunosSmcCpu_ResetCtrl_reg_t.core0_reset_n_n0_scan */
 #define KER_RESET_CTRL_CORE0_RESET_N_BIT 0u
 
-/* BL0P5 execute location: 64KB from end of ram0 (0xC015b000 - 0x10000) */
-#define KER_SMC_BL0P5_LOAD_ADDR         0xC014B000ULL
+/* BL0P5 execute location: 64KB from end of ram0 (0xC0160000 - 0x10000) */
+#define KER_SMC_BL0P5_LOAD_ADDR         0xC0150000ULL
 /* Scratch registers used for the BL0P5 <-> host handshake (local addresses) */
 #define KER_HOST_BOOT_STATE_LOCAL        0xC0010160ULL  /* SCRATCH[12] */
 #define KER_BUNDLE_VALIDATION_LOCAL      0xC0010150ULL  /* SCRATCH[10] */
@@ -187,20 +187,20 @@ static void usage(const char *prog)
 {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s <k|m> <0|1> [device_id]\n", prog);
-    fprintf(stderr, "  %s <k|m> -i <build_dir> [device_id]\n", prog);
-    fprintf(stderr, "  %s <k|m> -i <build_dir> --blop5 <blop5_build_dir> --mbl1 <mbl1_build_dir> [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m> --kbl1 <build_dir> [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m> --kbl1 <build_dir> --blop5 <blop5_build_dir> --mbl1 <mbl1_build_dir> [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> --bl0 [device_id]\n", prog);
     fprintf(stderr, "  k = SPA base 0x12020..., m = SPA base 0x13000...\n");
     fprintf(stderr, "  0 = hold SMC RISC-V in reset\n");
     fprintf(stderr, "  1 = release SMC RISC-V from reset\n");
-    fprintf(stderr, "  -i = hold reset, load <build_dir>/zephyr/zephyr.bin, release reset\n");
-    fprintf(stderr, "  -i + --blop5 + --mbl1 = boot blop5, handshake bundle of kbl1 + mbl1\n");
+    fprintf(stderr, "  --kbl1 = hold reset, load <build_dir>/zephyr/zephyr.bin, release reset\n");
+    fprintf(stderr, "  --kbl1 + --blop5 + --mbl1 = boot blop5, handshake bundle of kbl1 + mbl1\n");
     fprintf(stderr, "  --bl0 = hold reset, wipe SRAM, set RESET_VECTOR[0] to 0xC0040000, release reset\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s k 0\n", prog);
     fprintf(stderr, "  %s k 1 3\n", prog);
-    fprintf(stderr, "  %s m -i build\n", prog);
-    fprintf(stderr, "  %s k -i build_k --blop5 build_blop5 --mbl1 build_mbl1\n", prog);
+    fprintf(stderr, "  %s m --kbl1 build\n", prog);
+    fprintf(stderr, "  %s k --kbl1 build_k --blop5 build_blop5 --mbl1 build_mbl1\n", prog);
 }
 
 static int parse_mode_arg(const char *arg)
@@ -917,7 +917,8 @@ int main(int argc, char **argv)
                 return 2;
             }
         }
-    } else if (!strcmp(argv[2], "-i")) {
+    } else if (!strcmp(argv[2], "--kbl1") ||
+               (!blop5_mode && !strcmp(argv[2], "-i"))) {
         image_mode = 1;
         if (argc != 4 && argc != 5) {
             usage(argv[0]);
@@ -932,6 +933,10 @@ int main(int argc, char **argv)
                 return 2;
             }
         }
+    } else if (!strcmp(argv[2], "-i") && blop5_mode) {
+        fprintf(stderr, "-i is not valid with --blop5; use --kbl1 <kbl1_build_dir>\n");
+        usage(argv[0]);
+        return 2;
     } else if (!strcmp(argv[2], "-v")) {
         verify = 1;
         if (argc != 4 && argc != 5) {
@@ -972,7 +977,7 @@ int main(int argc, char **argv)
     }
 
     if (blop5_mode && !image_mode) {
-        fprintf(stderr, "--blop5 requires -i <kbl1_build_dir>\n");
+        fprintf(stderr, "--blop5 requires --kbl1 <kbl1_build_dir>\n");
         usage(argv[0]);
         return 2;
     }
