@@ -520,13 +520,12 @@ static int load_image_to_smc(int fd, const char *image_path)
     return load_image_to_spa(fd, image_path, load_spa);
 }
 
-static int verify_image_in_smc(int fd, const char *image_path)
+static int verify_image_at_spa(int fd, const char *image_path, uint64_t load_spa)
 {
     int rc;
     int image_fd;
     struct stat st;
     off_t offset = 0;
-    uint64_t load_spa;
 
     image_fd = open(image_path, O_RDONLY);
     if (image_fd < 0) {
@@ -547,7 +546,6 @@ static int verify_image_in_smc(int fd, const char *image_path)
         return -EINVAL;
     }
 
-    load_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
     printf("Verifying %lld bytes at SPA=0x%012llx\n",
            (long long)st.st_size, (unsigned long long)load_spa);
 
@@ -608,6 +606,11 @@ static int verify_image_in_smc(int fd, const char *image_path)
     close(image_fd);
     printf("Image verify passed\n");
     return 0;
+}
+
+static int verify_image_in_smc(int fd, const char *image_path)
+{
+    return verify_image_at_spa(fd, image_path, local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR));
 }
 
 static int poll_scratch_eq(int fd, uint64_t spa, uint32_t expected)
@@ -903,6 +906,9 @@ static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
 
     /* Load BL0P5 to its execute location */
     rc = load_image_to_spa(fd, blop5_path, local_addr_to_spa(KER_SMC_BL0P5_LOAD_ADDR));
+    if (rc) return rc;
+
+    rc = verify_image_at_spa(fd, blop5_path, local_addr_to_spa(KER_SMC_BL0P5_LOAD_ADDR));
     if (rc) return rc;
 
     /* Aim the reset vector at BL0P5 */
