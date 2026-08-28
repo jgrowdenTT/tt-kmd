@@ -42,7 +42,7 @@
 #define KER_SCRATCH2_OFFSET  0x10110ULL
 #define KER_SCRATCH0_OFFSET  0x10100ULL
 #define KER_VUART_MAGIC       0x775e21a1u
-#define KER_VUART_MAX_CAP     4096u
+#define KER_VUART_MAX_CAP     8192u
 #define KER_VUART_POLL_US     10000
 
 struct tenstorrent_get_device_info {
