@@ -49,7 +49,7 @@
 
 #define KER_SMC_CORE_LOCAL_BASE 0xC0000000ULL
 #define KER_SPA_BASE_K          0x1202000000ULL
-#define KER_SPA_BASE_M          0x1300000000ULL
+#define KER_SPA_BASE_M1         0x1308000000ULL
 #define KER_RESET_CTRL_OFFSET   0x10020ULL
 #define KER_RESET_VECTOR0_OFFSET 0x10000ULL
 #define KER_SCRATCH_BASE_OFFSET 0x10100ULL
@@ -220,7 +220,7 @@ static int parse_mode_arg(const char *arg)
         g_spa_base = KER_SPA_BASE_K;
         return 0;
     case 'm':
-        g_spa_base = KER_SPA_BASE_M;
+        g_spa_base = KER_SPA_BASE_M1;
         return 0;
     default:
         return -EINVAL;
@@ -1195,7 +1195,7 @@ int main(int argc, char **argv)
     }
 
     if (direct_sysbuild_mode) {
-        g_spa_base = KER_SPA_BASE_M;
+        g_spa_base = KER_SPA_BASE_M1;
         rc = do_bl0_boot(fd);
         if (rc) {
             close(fd);

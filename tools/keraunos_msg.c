@@ -40,7 +40,7 @@
 #define KERAUNOS_PCI_DEVICE_ID    0xfeed
 
 #define SMC_SPA_BASE_K 0x1202000000ULL
-#define SMC_SPA_BASE_M 0x1300000000ULL
+#define SMC_SPA_BASE_M1 0x1308000000ULL
 
 /* SMC CPU Control SCRATCH registers */
 #define SMC_CPUCTRL_SCRATCH_BASE_OFFSET 0x10100ULL
@@ -145,7 +145,7 @@ static int parse_mode_arg(const char *arg)
 		g_spa_base = SMC_SPA_BASE_K;
 		return 0;
 	case 'm':
-		g_spa_base = SMC_SPA_BASE_M;
+		   g_spa_base = SMC_SPA_BASE_M1;
 		return 0;
 	default:
 		return -EINVAL;

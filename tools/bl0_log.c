@@ -29,7 +29,7 @@
 #define KERAUNOS_PCI_DEVICE_ID 0xfeed
 
 #define KER_SPA_BASE 0x1202000000ULL
-#define MIMIR_SPA_BASE 0x1300000000ULL
+#define MIMIR_M1_SPA_BASE 0x1308000000ULL
 #define SMC_SRAM_BASE 0xC0060000ULL
 #define SMC_SRAM_SIZE 0x100000ULL
 #define SMC_STATUS_BUFFER_ADDR (SMC_SRAM_BASE + SMC_SRAM_SIZE - 2 * 0x80C)
@@ -276,7 +276,7 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 2;
     }
-    g_spa_base = (argv[1][0] == 'm' || argv[1][0] == 'M') ? MIMIR_SPA_BASE : KER_SPA_BASE;
+    g_spa_base = (argv[1][0] == 'm' || argv[1][0] == 'M') ? MIMIR_M1_SPA_BASE : KER_SPA_BASE;
 
     for (int argument = 2; argument < argc; argument++) {
         if (strcmp(argv[argument], "--follow") == 0) {
@@ -308,7 +308,7 @@ int main(int argc, char **argv)
 
     printf("Reading SMC BL0 status ring at SPA 0x%012llx (%s)\n",
            (unsigned long long)status_buffer_spa(),
-           g_spa_base == MIMIR_SPA_BASE ? "Mimir" : "Keraunos");
+           g_spa_base == MIMIR_M1_SPA_BASE ? "Mimir M1" : "Keraunos");
     do {
         rc = print_pending(fd, &observed_tail);
         if (rc) {
