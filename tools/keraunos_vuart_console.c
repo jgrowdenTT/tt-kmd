@@ -38,7 +38,7 @@
 
 #define KER_SMC_CORE_LOCAL_BASE 0xC0000000ULL
 #define KER_SPA_BASE_K       0x1202000000ULL
-#define KER_SPA_BASE_M       0x1300000000ULL
+#define KER_SPA_BASE_M1      0x1308000000ULL
 #define KER_SCRATCH2_OFFSET  0x10110ULL
 #define KER_SCRATCH0_OFFSET  0x10100ULL
 #define KER_VUART_MAGIC       0x775e21a1u
@@ -135,7 +135,7 @@ static int parse_mode_arg(const char *arg)
 		g_spa_base = KER_SPA_BASE_K;
 		return 0;
 	case 'm':
-		g_spa_base = KER_SPA_BASE_M;
+		 g_spa_base = KER_SPA_BASE_M1;
 		return 0;
 	default:
 		return -EINVAL;
