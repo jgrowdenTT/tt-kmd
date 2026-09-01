@@ -71,7 +71,8 @@
 /* BL0P5 execute location: 64KB from end of ram0 (0xC0160000 - 0x10000) */
 #define KER_SMC_BL0P5_LOAD_ADDR         0xC0150000ULL
 #define KER_SMC_KMIS_LOAD_ADDR          0xC0067000ULL
-#define MIMIR_SMC_MIS_LOAD_ADDR         0x1300067000ULL
+#define MIMIR_SMC_MIS_LOAD_ADDR         (KER_SPA_BASE_M1 + \
+                                         (KER_SMC_KMIS_LOAD_ADDR - KER_SMC_CORE_LOCAL_BASE))
 /* Scratch registers used for the BL0P5 <-> host handshake (local addresses) */
 #define KER_HOST_BOOT_STATE_LOCAL        0xC0010160ULL  /* SCRATCH[12] */
 #define KER_BUNDLE_VALIDATION_LOCAL      0xC0010150ULL  /* SCRATCH[10] */
