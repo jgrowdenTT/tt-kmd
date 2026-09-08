@@ -542,8 +542,7 @@ int main(int argc, char **argv)
 		close(hs.fd);
 		return 1;
 	}
-	if (hs.d.tx_cap == 0 || hs.d.rx_cap == 0 || hs.d.tx_cap > KER_VUART_MAX_CAP ||
-	    hs.d.rx_cap > KER_VUART_MAX_CAP) {
+	if (hs.d.tx_cap == 0 || hs.d.rx_cap == 0) {
 		fprintf(stderr, "invalid VUART caps tx=%u rx=%u\n", hs.d.tx_cap, hs.d.rx_cap);
 		close(hs.fd);
 		return 1;
