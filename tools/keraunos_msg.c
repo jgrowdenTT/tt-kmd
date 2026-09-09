@@ -4,7 +4,7 @@
 // Keraunos message queue utility via TENSTORRENT_IOCTL_KER_READ32/_KER_WRITE32.
 //
 // Firmware contract:
-//   - SMC cpu_ctrl SCRATCH_3 stores a 32-bit pointer to the message queue header.
+//   - Cold Scratch 3 (0xc000280c) stores a 32-bit pointer to the message queue header.
 //   - Message queue contains request and response queues for inter-processor communication.
 //
 // Build:
@@ -42,9 +42,8 @@
 #define SMC_SPA_BASE_K 0x1202000000ULL
 #define SMC_SPA_BASE_M1 0x1308000000ULL
 
-/* SMC CPU Control SCRATCH registers */
-#define SMC_CPUCTRL_SCRATCH_BASE_OFFSET 0x10100ULL
-#define SMC_CPUCTRL_SCRATCH_STRIDE 0x8
+/* Cold Scratch 3 register (msgqueue_info pointer), dts addr 0xc000280c */
+#define SMC_COLD_SCRATCH3_OFFSET 0x280cULL
 
 /* Mailbox registers for messaging */
 #define SMC_MBOX_BASE_OFFSET        0x18000ULL
@@ -122,10 +121,9 @@ struct host_state {
 	struct message_queue_header mq_header;
 };
 
-static uint64_t smc_cpuctrl_scratch_spa(unsigned int idx)
+static uint64_t smc_cold_scratch3_spa(void)
 {
-	return g_spa_base + SMC_CPUCTRL_SCRATCH_BASE_OFFSET +
-	       ((uint64_t)idx * SMC_CPUCTRL_SCRATCH_STRIDE);
+	return g_spa_base + SMC_COLD_SCRATCH3_OFFSET;
 }
 
 static uint64_t smc_mbox_write_data_spa(unsigned int chan)
@@ -486,18 +484,18 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* Get message queue info pointer from SCRATCH_3 */
+	/* Get message queue info pointer from Cold Scratch 3 */
 	uint32_t mq_info_ptr = 0;
 	uint32_t mq_base_ptr = 0;
-	rc = read32_ioctl(hs.fd, smc_cpuctrl_scratch_spa(3), &mq_info_ptr);
+	rc = read32_ioctl(hs.fd, smc_cold_scratch3_spa(), &mq_info_ptr);
 	if (rc) {
-		fprintf(stderr, "Failed to read SCRATCH_3: %s\n", strerror(-rc));
+		fprintf(stderr, "Failed to read Cold Scratch 3: %s\n", strerror(-rc));
 		close(hs.fd);
 		return 1;
 	}
 
 	if (mq_info_ptr == 0) {
-		fprintf(stderr, "Message queue not initialized (SCRATCH_3 = 0)\n");
+		fprintf(stderr, "Message queue not initialized (Cold Scratch 3 = 0)\n");
 		close(hs.fd);
 		return 1;
 	}
