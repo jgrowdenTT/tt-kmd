@@ -194,13 +194,14 @@ static void usage(const char *prog)
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s --sysbuild <sysbuild_dir> [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> <0|1> [device_id]\n", prog);
-    fprintf(stderr, "  %s <k|m> --kbl1 <build_dir> [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m> --kbl1 <build_dir> [-r <hex_addr>] [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> --blop5 --sysbuild <sysbuild_dir> [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> --bl0 [device_id]\n", prog);
     fprintf(stderr, "  k = SPA base 0x12020..., m = SPA base 0x13000...\n");
     fprintf(stderr, "  0 = hold SMC RISC-V in reset\n");
     fprintf(stderr, "  1 = release SMC RISC-V from reset\n");
     fprintf(stderr, "  --kbl1 = hold reset, load <build_dir>/zephyr/zephyr.bin, release reset\n");
+    fprintf(stderr, "  -r <hex_addr> = (with -i/--kbl1 only) load/execute from this local address instead of the default\n");
     fprintf(stderr, "  --blop5 --sysbuild = boot blop5 using all images from a sysbuild directory\n");
     fprintf(stderr, "  --bl0 = hold reset, wipe SRAM, set RESET_VECTOR[0] to 0xC0040000, release reset\n");
     fprintf(stderr, "Examples:\n");
@@ -268,11 +269,6 @@ static int set_reset_vector(int fd, uint64_t reset_vector)
     printf("RESET_VECTOR[0] = 0x%08x (SPA=0x%012llx)\n",
            readback, (unsigned long long)reset_vector0_spa());
     return 0;
-}
-
-static int set_bl1_reset_vector(int fd)
-{
-    return set_reset_vector(fd, KER_SMC_BL1_RESET_VECTOR);
 }
 
 static int wipe_smc_sram(int fd)
@@ -509,16 +505,6 @@ static int load_image_to_spa(int fd, const char *image_path, uint64_t load_spa)
 
     close(image_fd);
     return 0;
-}
-
-static int load_image_to_smc(int fd, const char *image_path)
-{
-    uint64_t load_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
-
-    printf("Using reset-vector default local=0x%08llx -> load SPA=0x%012llx\n",
-           (unsigned long long)KER_SMC_BL1_RESET_VECTOR,
-           (unsigned long long)load_spa);
-    return load_image_to_spa(fd, image_path, load_spa);
 }
 
 static int verify_image_at_spa(int fd, const char *image_path, uint64_t load_spa)
@@ -1025,6 +1011,9 @@ int main(int argc, char **argv)
     int scratch = 0;
     int bl0_mode = 0;
     int direct_sysbuild_mode = 0;
+    char *reset_vector_arg = NULL;
+    uint64_t custom_reset_vector = 0;
+    int have_custom_reset_vector = 0;
     int fd;
     int rc;
 
@@ -1068,6 +1057,23 @@ int main(int argc, char **argv)
             sysbuild_path = argv[sysbuild_i + 1];
             for (int sysbuild_j = sysbuild_i; sysbuild_j < argc - 2; sysbuild_j++) {
                 argv[sysbuild_j] = argv[sysbuild_j + 2];
+            }
+            argc -= 2;
+            break;
+        }
+    }
+
+    /* Pre-scan: extract -r <hex_addr> before mode-specific argument parsing (only valid with -i/--kbl1) */
+    for (int rv_i = 2; rv_i < argc; rv_i++) {
+        if (!strcmp(argv[rv_i], "-r")) {
+            if (rv_i + 1 >= argc) {
+                fprintf(stderr, "-r requires a hex address argument\n");
+                usage(argv[0]);
+                return 2;
+            }
+            reset_vector_arg = argv[rv_i + 1];
+            for (int rv_j = rv_i; rv_j < argc - 2; rv_j++) {
+                argv[rv_j] = argv[rv_j + 2];
             }
             argc -= 2;
             break;
@@ -1174,6 +1180,21 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    if (reset_vector_arg) {
+        if (!image_mode || blop5_mode) {
+            fprintf(stderr, "-r <hex_addr> is only valid with -i/--kbl1\n");
+            usage(argv[0]);
+            return 2;
+        }
+        endptr = NULL;
+        custom_reset_vector = strtoull(reset_vector_arg, &endptr, 16);
+        if (endptr == reset_vector_arg || *endptr != '\0') {
+            fprintf(stderr, "Invalid reset vector: %s\n", reset_vector_arg);
+            return 2;
+        }
+        have_custom_reset_vector = 1;
+    }
+
     if (image_path) {
         char *p = make_image_path(image_path);
         if (!p) return 1;
@@ -1223,25 +1244,28 @@ int main(int argc, char **argv)
                 return 1;
             }
         } else {
+            uint64_t effective_vector = have_custom_reset_vector ? custom_reset_vector
+                                                                  : KER_SMC_BL1_RESET_VECTOR;
+
             rc = set_reset_state(fd, 0u);
             if (rc) {
                 close(fd);
                 return 1;
             }
 
-            rc = load_image_to_smc(fd, image_path);
+            rc = load_image_to_spa(fd, image_path, local_addr_to_spa(effective_vector));
             if (rc) {
                 close(fd);
                 return 1;
             }
 
-            rc = verify_image_in_smc(fd, image_path);
+            rc = verify_image_at_spa(fd, image_path, local_addr_to_spa(effective_vector));
             if (rc) {
                 close(fd);
                 return 1;
             }
 
-            rc = set_bl1_reset_vector(fd);
+            rc = set_reset_vector(fd, effective_vector);
             if (rc) {
                 close(fd);
                 return 1;
