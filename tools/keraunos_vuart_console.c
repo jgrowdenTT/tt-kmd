@@ -556,6 +556,7 @@ int main(int argc, char **argv)
 		"Keraunos VUART: desc=0x%llx tx_cap=%u rx_cap=%u version=0x%08x\n"
 		"Ctrl-C to exit.\n",
 		(unsigned long long)hs.desc_spa, hs.d.tx_cap, hs.d.rx_cap, hs.d.version);
+	fprintf(stderr, "Press Ctrl-C or Ctrl-a,x to quit\n");
 
 	rc = set_terminal_raw();
 	if (rc) {
@@ -563,8 +564,6 @@ int main(int argc, char **argv)
 		close(hs.fd);
 		return 1;
 	}
-
-	fprintf(stderr, "Press Ctrl-C or Ctrl-a,x to quit\n");
 
 	for (; !g_stop;) {
 		unsigned char ch;
