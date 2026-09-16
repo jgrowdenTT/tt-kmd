@@ -670,6 +670,56 @@ static int poll_scratch_bit(int fd, uint64_t spa, uint32_t mask)
 }
 
 /*
+ * Fake a BUN1 being present in SRAM loaded by SEP BL0
+ */
+static int write_bun1_to_staging(int fd)
+{
+    int rc;
+    uint32_t i;
+    uint64_t staging_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
+
+    uint32_t hdr_words = (BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE) / 4;
+    uint32_t payload_len = BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE;
+
+    printf("Staging BUN1 at SPA=0x%012llx: manifest+toc+entries=%u bytes\n",
+           (unsigned long long)staging_spa,
+           BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 3u * BUNDLE_TOC_ENTRY_SIZE);
+
+    /* Zero the header region so unset fields don't contain stale values */
+    for (i = 0; i < hdr_words; i++)
+    {
+        rc = write32_ioctl(fd, staging_spa + (uint64_t)i * 4, 0u);
+        if (rc)
+        {
+            fprintf(stderr, "zero staging offset %u failed: %s\n", i * 4, strerror(-rc));
+            return rc;
+        }
+    }
+    uint64_t toc_spa = staging_spa + BUNDLE_MANIFEST_SIZE;
+
+    /* Manifest: only payload_offset (int64 at +1160) is read by the BL0p5 loader */
+    rc = write32_ioctl(fd, staging_spa + BUNDLE_MANIFEST_PAYLOAD_OFF_OFF, BUNDLE_MANIFEST_SIZE);
+    if (rc) return rc;
+
+    /* TOC header */
+    rc = write32_ioctl(fd, toc_spa + 0, BUNDLE_TOC_ID); /* toc_identifier */
+    if (rc) return rc;
+
+    rc = write32_ioctl(fd, toc_spa + 4, BUNDLE_TOC_VERSION_MAJOR); /* major=1, minor=0 */
+    if (rc) return rc;
+
+    rc = write32_ioctl(fd, toc_spa + 8, payload_len); /* payload_length lo */
+    if (rc) return rc;
+
+    /* payload_length hi = 0 (already zeroed) */
+    rc = write32_ioctl(fd, toc_spa + 16, 3u); /* image_count = 3 */
+    if (rc) return rc;
+
+    /*The rest doesn't really matter maybe...*/
+    return 0;
+}
+
+/*
  * Write a minimal fw_bundle_manifest + fw_bundle_toc + fw_bundle_toc_entry[0..1] + images
  * into the staging area so the bun2 loader can parse and copy it.
  *
@@ -680,12 +730,12 @@ static int poll_scratch_bit(int fd, uint64_t spa, uint32_t mask)
  *   [1432 .. 1647] fw_bundle_toc_entry[1]: mbl1 (216 bytes)
  *   [1648 .. ]     kbl1 image data, then mbl1 image data
  */
-static int write_bundle_to_staging(int fd, const char *bl1_path, off_t image_size,
+static int write_bun2_to_staging(int fd, const char *bl1_path, off_t image_size,
                                    const char *mbl1_path, off_t mbl1_size)
 {
     int rc;
     uint32_t i;
-    /* BL0P5 expects the bundle manifest at 0xC0067000. */
+    /* BL0P5 expects the bundle manifest at 0xC0066400. */
     uint64_t staging_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
     uint32_t hdr_words = (BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE) / 4;
     uint32_t payload_len = BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE + (uint32_t)image_size
@@ -695,7 +745,7 @@ static int write_bundle_to_staging(int fd, const char *bl1_path, off_t image_siz
     uint64_t entry1_spa = entry_spa + BUNDLE_TOC_ENTRY_SIZE;
     uint64_t mbl1_offset = BUNDLE_IMG0_PAYLOAD_OFFSET + (uint64_t)image_size;
 
-    printf("Staging bundle at SPA=0x%012llx: manifest+toc+entries=%u bytes, kbl1=%lld bytes\n",
+    printf("Staging BUN2 at SPA=0x%012llx: manifest+toc+entries=%u bytes, kbl1=%lld bytes\n",
            (unsigned long long)staging_spa,
            BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE,
            (long long)image_size);
@@ -919,6 +969,10 @@ static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
     rc = set_reset_state(fd, 0u);
     if (rc) return rc;
 
+    /* Load BUN1 to its stage */
+    rc = write_bun1_to_staging(fd);
+    if (rc) return rc;
+
     /* Load BL0P5 to its execute location */
     rc = load_image_to_spa(fd, blop5_path, local_addr_to_spa(KER_SMC_BL0P5_LOAD_ADDR));
     if (rc) return rc;
@@ -941,7 +995,7 @@ static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
     if (rc) return rc;
 
     /* C+D) Write bundle manifest, TOC entries, and images into the staging area */
-    rc = write_bundle_to_staging(fd, bl1_path, st.st_size,
+    rc = write_bun2_to_staging(fd, bl1_path, st.st_size,
                                  mbl1_path, mbl1_path ? mbl1_st.st_size : 0);
     if (rc) return rc;
 
