@@ -76,10 +76,19 @@
 /* Scratch registers used for the BL0P5 <-> host handshake (local addresses) */
 #define KER_HOST_BOOT_STATE_LOCAL        0xC0010160ULL  /* SCRATCH[12] */
 #define KER_BUNDLE_VALIDATION_LOCAL      0xC0010150ULL  /* SCRATCH[10] */
+#define KER_SMC_SCRATCH_SMC_STATUS_TO_SEP 0xC0010148ULL /* SCRATCH[9]  */
 #define KER_SEP_SAFE_OFFSET_SCRATCH      13u
 #define KER_SEP_SAFE_SIZE_SCRATCH        14u
 #define KER_SEP_SAFE_OFFSET              0u
 #define KER_SEP_SAFE_SIZE                (25u * 1024u)
+/* SEP handshake values */
+#define SMC_SEP_STATUS_SRAM_INIT_BIT 0      /* SMC SRAM initialized */
+#define SMC_SEP_STATUS_MANIFEST_READY_BIT 1 /* Manifest ready */
+#define SMC_SEP_STATUS_BUFFER_READY_BIT 2   /* Status buffer ready */
+
+#define SMC_SEP_STATUS_SRAM_INIT (1U << SMC_SEP_STATUS_SRAM_INIT_BIT)
+#define SMC_SEP_STATUS_MANIFEST_READY (1U << SMC_SEP_STATUS_MANIFEST_READY_BIT)
+#define SMC_SEP_STATUS_BUFFER_READY (1U << SMC_SEP_STATUS_BUFFER_READY_BIT)
 /* Handshake values written to the host-boot-state scratch register */
 #define HOST_BOOT_STATE_WAIT_FOR_BUNDLE  1u
 #define HOST_BOOT_STATE_BUNDLE_STAGED    2u
@@ -346,40 +355,6 @@ static int clear_scratch_regs(int fd)
             return rc;
         }
     }
-    return 0;
-}
-
-static int configure_sep_safe_sram(int fd)
-{
-    const uint32_t values[] = {KER_SEP_SAFE_OFFSET, KER_SEP_SAFE_SIZE};
-    const unsigned int indices[] = {KER_SEP_SAFE_OFFSET_SCRATCH,
-                                    KER_SEP_SAFE_SIZE_SCRATCH};
-
-    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
-        uint32_t readback = 0;
-        int rc = write32_ioctl(fd, scratch_spa(indices[i]), values[i]);
-
-        if (rc) {
-            fprintf(stderr, "write SCRATCH_%u (0x%012llx) failed: %s\n",
-                    indices[i], (unsigned long long)scratch_spa(indices[i]), strerror(-rc));
-            return rc;
-        }
-
-        rc = read32_ioctl(fd, scratch_spa(indices[i]), &readback);
-        if (rc) {
-            fprintf(stderr, "readback SCRATCH_%u (0x%012llx) failed: %s\n",
-                    indices[i], (unsigned long long)scratch_spa(indices[i]), strerror(-rc));
-            return rc;
-        }
-        if (readback != values[i]) {
-            fprintf(stderr, "SCRATCH_%u readback mismatch: expected 0x%08x got 0x%08x\n",
-                    indices[i], values[i], readback);
-            return -EIO;
-        }
-    }
-
-    printf("SEP-safe SRAM: offset=0x%x size=0x%x (%u KiB)\n",
-           KER_SEP_SAFE_OFFSET, KER_SEP_SAFE_SIZE, KER_SEP_SAFE_SIZE / 1024u);
     return 0;
 }
 
@@ -929,7 +904,19 @@ static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
     rc = set_reset_state(fd, 0u);
     if (rc) return rc;
 
-    rc = configure_sep_safe_sram(fd);
+    /* Aim the reset vector at BL0. This lets it setup up the SEP-safe region */
+    rc = set_reset_vector(fd, KER_SMC_BL0_RESET_VECTOR);
+    if (rc) return rc;
+
+    /* Release reset; BL0 boots and initialises sep safe region*/
+    rc = set_reset_state(fd, 1u);
+    if (rc) return rc;
+
+    /* SEP-BL0 (?) Wait for SEP-SRAM init */
+    rc = poll_scratch_bit(fd, local_addr_to_spa(KER_SMC_SCRATCH_SMC_STATUS_TO_SEP),
+                          SMC_SEP_STATUS_SRAM_INIT);
+
+    rc = set_reset_state(fd, 0u);
     if (rc) return rc;
 
     /* Load BL0P5 to its execute location */
