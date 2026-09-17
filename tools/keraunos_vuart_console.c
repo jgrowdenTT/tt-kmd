@@ -228,6 +228,43 @@ static int read_desc(struct host_state *hs)
 	return 0;
 }
 
+// Reads scratch2 and the VUART descriptor, validating both. On success hs->desc_spa
+// and hs->d are populated with a live descriptor. Safe to call repeatedly to
+// (re)acquire the VUART after firmware transiently zeroes scratch2 during boot.
+static int acquire_vuart(struct host_state *hs)
+{
+	uint32_t ptr32 = 0;
+	uint64_t desc_spa;
+	int rc;
+
+	rc = read32_ioctl(hs->fd, scratch2_spa(), &ptr32);
+	if (rc) {
+		return rc;
+	}
+
+	desc_spa = (ptr32 >= KER_SMC_CORE_LOCAL_BASE)
+			   ? (g_spa_base + ((uint64_t)ptr32 - KER_SMC_CORE_LOCAL_BASE))
+			   : (uint64_t)ptr32;
+	if (desc_spa == 0 || desc_spa == 0xffffffffu) {
+		return -EINVAL;
+	}
+
+	hs->desc_spa = desc_spa;
+	rc = read_desc(hs);
+	if (rc) {
+		return rc;
+	}
+
+	if (hs->d.magic != KER_VUART_MAGIC) {
+		return -EINVAL;
+	}
+	if (hs->d.tx_cap == 0 || hs->d.rx_cap == 0) {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int write_rx_tail(struct host_state *hs, uint32_t val)
 {
 	return write32_ioctl(hs->fd, hs->desc_spa + (3ULL * 4ULL), val);
@@ -456,6 +493,7 @@ int main(int argc, char **argv)
 	int ctrl_a_pressed = 0;
 	int helper_mode = 0;
 	int retcode = 0;
+	int vuart_lost = 0;
 	int rc;
 
 	if (signal(SIGINT, handle_signal) == SIG_ERR) {
@@ -509,41 +547,9 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	{
-		uint32_t ptr32;
-
-		rc = read32_ioctl(hs.fd, scratch2_spa(), &ptr32);
-		hs.desc_spa = (ptr32 >= KER_SMC_CORE_LOCAL_BASE)
-				    ? (g_spa_base + ((uint64_t)ptr32 - KER_SMC_CORE_LOCAL_BASE))
-				    : (uint64_t)ptr32;
-	}
+	rc = acquire_vuart(&hs);
 	if (rc) {
-		fprintf(stderr, "read scratch2 failed: %s\n", strerror(-rc));
-		close(hs.fd);
-		return 1;
-	}
-	if (hs.desc_spa == 0 || hs.desc_spa == 0xffffffffu) {
-		fprintf(stderr, "scratch2 has invalid VUART pointer: 0x%08x\n", (uint32_t)hs.desc_spa);
-		close(hs.fd);
-		return 1;
-	}
-
-	rc = read_desc(&hs);
-	if (rc) {
-		fprintf(stderr, "read VUART descriptor @0x%llx failed: %s\n",
-			(unsigned long long)hs.desc_spa, strerror(-rc));
-		close(hs.fd);
-		return 1;
-	}
-
-	if (hs.d.magic != KER_VUART_MAGIC) {
-		fprintf(stderr, "bad VUART magic at 0x%llx: got 0x%08x expected 0x%08x\n",
-			(unsigned long long)hs.desc_spa, hs.d.magic, KER_VUART_MAGIC);
-		close(hs.fd);
-		return 1;
-	}
-	if (hs.d.tx_cap == 0 || hs.d.rx_cap == 0) {
-		fprintf(stderr, "invalid VUART caps tx=%u rx=%u\n", hs.d.tx_cap, hs.d.rx_cap);
+		fprintf(stderr, "acquire VUART descriptor failed: %s\n", strerror(-rc));
 		close(hs.fd);
 		return 1;
 	}
@@ -573,11 +579,19 @@ int main(int argc, char **argv)
 			n = read(STDIN_FILENO, &ch, 1);
 		}
 
-		rc = drain_device_tx(&hs);
-		if (rc && rc != -EAGAIN) {
-			fprintf(stderr, "VUART read failed: %s\n", strerror(-rc));
-			retcode = 1;
-			break;
+		if (vuart_lost) {
+			rc = acquire_vuart(&hs);
+			if (rc == 0) {
+				fprintf(stderr, "\r\nVUART reacquired, resuming log\r\n");
+				vuart_lost = 0;
+			}
+		} else {
+			rc = drain_device_tx(&hs);
+			if (rc && rc != -EAGAIN) {
+				fprintf(stderr, "\r\nVUART lost (%s), waiting for it to come back...\r\n",
+					strerror(-rc));
+				vuart_lost = 1;
+			}
 		}
 
 		if (n > 0) {
@@ -591,12 +605,12 @@ int main(int argc, char **argv)
 				continue;
 			} else if (ch == 0x03) {
 				break;
-			} else {
+			} else if (!vuart_lost) {
 				rc = send_host_char(&hs, ch);
 				if (rc && rc != -EAGAIN) {
-					fprintf(stderr, "VUART write failed: %s\n", strerror(-rc));
-					retcode = 1;
-					break;
+					fprintf(stderr, "\r\nVUART lost on write (%s), waiting for it to come back...\r\n",
+						strerror(-rc));
+					vuart_lost = 1;
 				}
 			}
 		} else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
