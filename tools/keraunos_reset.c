@@ -106,9 +106,10 @@
 #define BUNDLE_TOC_IMG_TYPE_BL1_HI       0x0000314cu  /* high 32b of FW_BUNDLE_IMG_TYPE_SMC_BL1 */
 #define BUNDLE_TOC_IMG_TYPE_MIS_LO       0x42434d53u  /* low  32b of FW_BUNDLE_IMG_TYPE_SMC_MIS */
 #define BUNDLE_TOC_IMG_TYPE_MIS_HI       0x0000324cu  /* high 32b of FW_BUNDLE_IMG_TYPE_SMC_MIS */
-/* Offset from payload start (= toc base) to image[0] in a 2-entry TOC */
+/* Offset from payload start (= toc base) to image[0] in a 2-entry TOC. */
 #define BUNDLE_IMG_PAYLOAD_OFFSET        (BUNDLE_TOC_HDR_SIZE + BUNDLE_TOC_ENTRY_SIZE)
 #define BUNDLE_IMG0_PAYLOAD_OFFSET       (BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE)
+#define BUNDLE_BUN2_IMG0_PAYLOAD_OFFSET  (BUNDLE_TOC_HDR_SIZE + 3u * BUNDLE_TOC_ENTRY_SIZE)
 #define BUN3_PAYLOAD_OFFSET              (KER_SMC_KMIS_LOAD_ADDR - KER_SMC_BL1_RESET_VECTOR - BUNDLE_IMG0_PAYLOAD_OFFSET)
 #define BUNDLE_POLL_TIMEOUT_US           10000000u  /* 10 s */
 
@@ -731,24 +732,27 @@ static int write_bun1_to_staging(int fd)
  *   [1648 .. ]     kbl1 image data, then mbl1 image data
  */
 static int write_bun2_to_staging(int fd, const char *bl1_path, off_t image_size,
-                                   const char *mbl1_path, off_t mbl1_size)
+                     const char *mbl1_path, off_t mbl1_size,
+                     const char *d2d_path, off_t d2d_size)
 {
     int rc;
     uint32_t i;
     /* BL0P5 expects the bundle manifest at 0xC0066400. */
     uint64_t staging_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
-    uint32_t hdr_words = (BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE) / 4;
-    uint32_t payload_len = BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE + (uint32_t)image_size
-                            + (uint32_t)mbl1_size;
+    uint32_t hdr_words = (BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 3u * BUNDLE_TOC_ENTRY_SIZE) / 4;
+    uint32_t payload_len = BUNDLE_TOC_HDR_SIZE + 3u * BUNDLE_TOC_ENTRY_SIZE + (uint32_t)image_size
+                + (uint32_t)mbl1_size + (uint32_t)d2d_size;
     uint64_t toc_spa    = staging_spa + BUNDLE_MANIFEST_SIZE;
     uint64_t entry_spa  = toc_spa + BUNDLE_TOC_HDR_SIZE;
     uint64_t entry1_spa = entry_spa + BUNDLE_TOC_ENTRY_SIZE;
-    uint64_t mbl1_offset = BUNDLE_IMG0_PAYLOAD_OFFSET + (uint64_t)image_size;
+    uint64_t entry2_spa = entry1_spa + BUNDLE_TOC_ENTRY_SIZE;
+    uint64_t mbl1_offset = BUNDLE_BUN2_IMG0_PAYLOAD_OFFSET + (uint64_t)image_size;
+    uint64_t d2d_offset = mbl1_offset + (uint64_t)mbl1_size;
 
-    printf("Staging BUN2 at SPA=0x%012llx: manifest+toc+entries=%u bytes, kbl1=%lld bytes\n",
+    printf("Staging BUN2 at SPA=0x%012llx: manifest+toc+entries=%u bytes, kbl1=%lld bytes, d2d=%lld bytes\n",
            (unsigned long long)staging_spa,
-           BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE,
-           (long long)image_size);
+        BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 3u * BUNDLE_TOC_ENTRY_SIZE,
+        (long long)image_size, (long long)d2d_size);
 
     /* Zero the header region so unset fields don't contain stale values */
     for (i = 0; i < hdr_words; i++) {
@@ -772,7 +776,7 @@ static int write_bun2_to_staging(int fd, const char *bl1_path, off_t image_size,
     rc = write32_ioctl(fd, toc_spa +  8, payload_len);              /* payload_length lo */
     if (rc) return rc;
     /* payload_length hi = 0 (already zeroed) */
-    rc = write32_ioctl(fd, toc_spa + 16, 2u);                       /* image_count = 2 */
+    rc = write32_ioctl(fd, toc_spa + 16, 3u);                       /* image_count = 3 */
     if (rc) return rc;
     /* image_count hi + reserved = 0 (already zeroed) */
 
@@ -781,7 +785,7 @@ static int write_bun2_to_staging(int fd, const char *bl1_path, off_t image_size,
     if (rc) return rc;
     rc = write32_ioctl(fd, entry_spa +  4, BUNDLE_TOC_IMG_TYPE_BL1_HI); /* type hi */
     if (rc) return rc;
-    rc = write32_ioctl(fd, entry_spa +  8, BUNDLE_IMG0_PAYLOAD_OFFSET); /* offset lo (from payload start) */
+    rc = write32_ioctl(fd, entry_spa +  8, BUNDLE_BUN2_IMG0_PAYLOAD_OFFSET); /* offset lo (from payload start) */
     if (rc) return rc;
     /* offset hi = 0 */
     rc = write32_ioctl(fd, entry_spa + 16, (uint32_t)image_size);        /* length lo */
@@ -817,9 +821,23 @@ static int write_bun2_to_staging(int fd, const char *bl1_path, off_t image_size,
     if (rc) return rc;
     /* entry_point hi = 0 */
 
+    /* TOC entry[2]: D2D firmware (image data follows mbl1). */
+    rc = write32_ioctl(fd, entry2_spa + 0, BUNDLE_TOC_IMG_TYPE_BL1_LO); /* type lo */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry2_spa + 4, BUNDLE_TOC_IMG_TYPE_BL1_HI); /* type hi */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry2_spa + 8, (uint32_t)d2d_offset);         /* offset lo */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry2_spa + 12, (uint32_t)(d2d_offset >> 32)); /* offset hi */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry2_spa + 16, (uint32_t)d2d_size);           /* length lo */
+    if (rc) return rc;
+    rc = write32_ioctl(fd, entry2_spa + 20, (uint32_t)((uint64_t)d2d_size >> 32));
+    if (rc) return rc;
+
     /* Write kbl1 image after both TOC entries */
     rc = load_image_to_spa(fd, bl1_path,
-                           staging_spa + BUNDLE_MANIFEST_SIZE + BUNDLE_IMG0_PAYLOAD_OFFSET);
+                           staging_spa + BUNDLE_MANIFEST_SIZE + BUNDLE_BUN2_IMG0_PAYLOAD_OFFSET);
     if (rc) return rc;
 
     /* Write mbl1 image immediately after kbl1 */
@@ -829,7 +847,8 @@ static int write_bun2_to_staging(int fd, const char *bl1_path, off_t image_size,
         if (rc) return rc;
     }
 
-    return 0;
+    return load_image_to_spa(fd, d2d_path,
+                             staging_spa + BUNDLE_MANIFEST_SIZE + d2d_offset);
 }
 
 static int write_mis_bundle_to_staging(int fd, const char *kmis_path, off_t kmis_size,
@@ -920,13 +939,14 @@ static int write_mis_bundle_to_staging(int fd, const char *kmis_path, off_t kmis
 }
 
 static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
-                         const char *mbl1_path, const char *kmis_path,
+                         const char *mbl1_path, const char *d2d_path, const char *kmis_path,
                          const char *mmis_path)
 {
     int rc;
     uint32_t val;
     struct stat st;
     struct stat mbl1_st = {0};
+    struct stat d2d_st = {0};
     struct stat kmis_st = {0};
     struct stat mmis_st = {0};
 
@@ -937,6 +957,11 @@ static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
 
     if (mbl1_path && (stat(mbl1_path, &mbl1_st) < 0 || !S_ISREG(mbl1_st.st_mode))) {
         fprintf(stderr, "cannot stat mbl1 image %s: %s\n", mbl1_path, strerror(errno));
+        return -errno;
+    }
+
+    if (stat(d2d_path, &d2d_st) < 0 || !S_ISREG(d2d_st.st_mode)) {
+        fprintf(stderr, "cannot stat d2d image %s: %s\n", d2d_path, strerror(errno));
         return -errno;
     }
 
@@ -996,7 +1021,8 @@ static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
 
     /* C+D) Write bundle manifest, TOC entries, and images into the staging area */
     rc = write_bun2_to_staging(fd, bl1_path, st.st_size,
-                                 mbl1_path, mbl1_path ? mbl1_st.st_size : 0);
+                                 mbl1_path, mbl1_path ? mbl1_st.st_size : 0,
+                                 d2d_path, d2d_st.st_size);
     if (rc) return rc;
 
     /* Signal that the bundle is staged */
@@ -1075,6 +1101,20 @@ static char *make_image_path_from_sysbuild(const char *sysbuild_dir, const char 
     return path;
 }
 
+static char *make_d2d_image_path_from_sysbuild(const char *sysbuild_dir)
+{
+    const char *suffix = "/grendel-sival-sdk/grendel_sival_sdk/firmware/libs/chip_init/d2d_fw/d2d_fw.bin";
+    size_t len = strlen(sysbuild_dir) + 1 + strlen("bl1_keraunos") + strlen(suffix) + 1;
+    char *path = malloc(len);
+
+    if (!path) {
+        fprintf(stderr, "out of memory\n");
+        return NULL;
+    }
+    snprintf(path, len, "%s/%s%s", sysbuild_dir, "bl1_keraunos", suffix);
+    return path;
+}
+
 int main(int argc, char **argv)
 {
     char dev_path[64];
@@ -1084,6 +1124,7 @@ int main(int argc, char **argv)
     char *image_path = NULL;
     char *blop5_path = NULL;
     char *mbl1_path = NULL;
+    char *d2d_path = NULL;
     char *kmis_path = NULL;
     char *mmis_path = NULL;
     char *sysbuild_path = NULL;
@@ -1286,9 +1327,10 @@ int main(int argc, char **argv)
         blop5_path = make_image_path_from_sysbuild(sysbuild_path, "bl0p5_keraunos");
         image_path = make_image_path_from_sysbuild(sysbuild_path, "bl1_keraunos");
         mbl1_path = make_image_path_from_sysbuild(sysbuild_path, "bl1_mimir");
+        d2d_path = make_d2d_image_path_from_sysbuild(sysbuild_path);
         kmis_path = make_image_path_from_sysbuild(sysbuild_path, "mis");
         mmis_path = make_image_path_from_sysbuild(sysbuild_path, "mis_mimir");
-        if (!blop5_path || !image_path || !mbl1_path || !kmis_path || !mmis_path) return 1;
+        if (!blop5_path || !image_path || !mbl1_path || !d2d_path || !kmis_path || !mmis_path) return 1;
     }
 
     snprintf(dev_path, sizeof(dev_path), "/dev/tenstorrent/%ld", dev_id);
@@ -1313,14 +1355,16 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        rc = do_blop5_boot(fd, blop5_path, image_path, mbl1_path, kmis_path, mmis_path);
+        rc = do_blop5_boot(fd, blop5_path, image_path, mbl1_path, d2d_path,
+                   kmis_path, mmis_path);
         if (rc) {
             close(fd);
             return 1;
         }
     } else if (image_mode) {
         if (blop5_mode) {
-            rc = do_blop5_boot(fd, blop5_path, image_path, mbl1_path, kmis_path, mmis_path);
+            rc = do_blop5_boot(fd, blop5_path, image_path, mbl1_path, d2d_path,
+                               kmis_path, mmis_path);
             if (rc) {
                 close(fd);
                 return 1;
