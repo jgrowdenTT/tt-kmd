@@ -206,7 +206,7 @@ static int open_tt_dev(const char *path, uint16_t expected_device_id)
 static void usage(const char *prog)
 {
     fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s --sysbuild <sysbuild_dir> [device_id]\n", prog);
+    fprintf(stderr, "  %s --sysbuild <sysbuild_dir> [--skip-bl0p5-load] [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> <0|1> [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> --kbl1 <build_dir> [-r <hex_addr>] [device_id]\n", prog);
     fprintf(stderr, "  %s <k|m> --blop5 --sysbuild <sysbuild_dir> [device_id]\n", prog);
@@ -217,6 +217,7 @@ static void usage(const char *prog)
     fprintf(stderr, "  --kbl1 = hold reset, load <build_dir>/zephyr/zephyr.bin, release reset\n");
     fprintf(stderr, "  -r <hex_addr> = (with -i/--kbl1 only) load/execute from this local address instead of the default\n");
     fprintf(stderr, "  --blop5 --sysbuild = boot blop5 using all images from a sysbuild directory\n");
+    fprintf(stderr, "  --skip-bl0p5-load = (with --sysbuild) don't launch K BL0/BL0P5; start at the bundle-ready poll\n");
     fprintf(stderr, "  --bl0 = hold reset, wipe SRAM, set RESET_VECTOR[0] to 0xC0040000, release reset\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s k 0\n", prog);
@@ -940,7 +941,7 @@ static int write_mis_bundle_to_staging(int fd, const char *kmis_path, off_t kmis
 
 static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
                          const char *mbl1_path, const char *d2d_path, const char *kmis_path,
-                         const char *mmis_path)
+                         const char *mmis_path, int skip_bl0p5_load)
 {
     int rc;
     uint32_t val;
@@ -973,6 +974,11 @@ static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
     if (stat(mmis_path, &mmis_st) < 0 || !S_ISREG(mmis_st.st_mode)) {
         fprintf(stderr, "cannot stat mmis image %s: %s\n", mmis_path, strerror(errno));
         return -errno;
+    }
+
+    if (skip_bl0p5_load) {
+        printf("Skipping BL0P5 load; assuming it is already running\n");
+        goto wait_for_bundle_ready;
     }
 
     /* Hold the core in reset */
@@ -1013,6 +1019,7 @@ static int do_blop5_boot(int fd, const char *blop5_path, const char *bl1_path,
     rc = set_reset_state(fd, 1u);
     if (rc) return rc;
 
+wait_for_bundle_ready:
     /* B) Wait for BL0P5 to signal it is ready to receive a bundle */
     printf("Waiting for BL0P5 bundle-ready signal...\n");
     rc = poll_scratch_eq(fd, local_addr_to_spa(KER_HOST_BOOT_STATE_LOCAL),
@@ -1134,6 +1141,7 @@ int main(int argc, char **argv)
     int scratch = 0;
     int bl0_mode = 0;
     int direct_sysbuild_mode = 0;
+    int skip_bl0p5_load = 0;
     char *reset_vector_arg = NULL;
     uint64_t custom_reset_vector = 0;
     int have_custom_reset_vector = 0;
@@ -1163,6 +1171,17 @@ int main(int argc, char **argv)
             blop5_mode = 1;
             for (int blop5_j = blop5_i; blop5_j < argc - 1; blop5_j++) {
                 argv[blop5_j] = argv[blop5_j + 1];
+            }
+            argc -= 1;
+            break;
+        }
+    }
+
+    for (int skip_i = 1; skip_i < argc; skip_i++) {
+        if (!strcmp(argv[skip_i], "--skip-bl0p5-load")) {
+            skip_bl0p5_load = 1;
+            for (int skip_j = skip_i; skip_j < argc - 1; skip_j++) {
+                argv[skip_j] = argv[skip_j + 1];
             }
             argc -= 1;
             break;
@@ -1297,6 +1316,12 @@ int main(int argc, char **argv)
         }
     }
 
+    if (skip_bl0p5_load && !blop5_mode) {
+        fprintf(stderr, "--skip-bl0p5-load is only valid with --sysbuild\n");
+        usage(argv[0]);
+        return 2;
+    }
+
     if (blop5_mode && !sysbuild_path) {
         fprintf(stderr, "--blop5 requires --sysbuild <sysbuild_dir>\n");
         usage(argv[0]);
@@ -1349,14 +1374,16 @@ int main(int argc, char **argv)
         }
 
         g_spa_base = KER_SPA_BASE_K;
-        rc = do_bl0_boot(fd);
-        if (rc) {
-            close(fd);
-            return 1;
+        if (!skip_bl0p5_load) {
+            rc = do_bl0_boot(fd);
+            if (rc) {
+                close(fd);
+                return 1;
+            }
         }
 
         rc = do_blop5_boot(fd, blop5_path, image_path, mbl1_path, d2d_path,
-                   kmis_path, mmis_path);
+                   kmis_path, mmis_path, skip_bl0p5_load);
         if (rc) {
             close(fd);
             return 1;
@@ -1364,7 +1391,7 @@ int main(int argc, char **argv)
     } else if (image_mode) {
         if (blop5_mode) {
             rc = do_blop5_boot(fd, blop5_path, image_path, mbl1_path, d2d_path,
-                               kmis_path, mmis_path);
+                               kmis_path, mmis_path, skip_bl0p5_load);
             if (rc) {
                 close(fd);
                 return 1;
