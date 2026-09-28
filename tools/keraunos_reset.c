@@ -1366,11 +1366,13 @@ int main(int argc, char **argv)
     }
 
     if (direct_sysbuild_mode) {
-        g_spa_base = KER_SPA_BASE_M1;
-        rc = do_bl0_boot(fd);
-        if (rc) {
-            close(fd);
-            return 1;
+        if (!skip_bl0p5_load) {
+            g_spa_base = KER_SPA_BASE_M1;
+            rc = do_bl0_boot(fd);
+            if (rc) {
+                close(fd);
+                return 1;
+            }
         }
 
         g_spa_base = KER_SPA_BASE_K;
