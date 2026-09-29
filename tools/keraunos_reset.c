@@ -438,12 +438,24 @@ static uint64_t local_addr_to_spa(uint64_t addr)
     return addr;
 }
 
+static void print_progress_bar(off_t done, off_t total)
+{
+    static const char fill[] = "########################################";
+    const int width = (int)(sizeof(fill) - 1);
+    int pct = (total > 0) ? (int)((done * 100) / total) : 100;
+    int filled = (pct * width) / 100;
+
+    printf("\r[%.*s%*s] %3d%%", filled, fill, width - filled, "", pct);
+    fflush(stdout);
+}
+
 static int load_image_to_spa(int fd, const char *image_path, uint64_t load_spa)
 {
     int rc;
     int image_fd;
     struct stat st;
     off_t offset = 0;
+    int last_pct = -1;
 
     image_fd = open(image_path, O_RDONLY);
     if (image_fd < 0) {
@@ -516,7 +528,19 @@ static int load_image_to_spa(int fd, const char *image_path, uint64_t load_spa)
         }
 
         offset += got;
+
+        {
+            int pct = (st.st_size > 0) ? (int)((offset * 100) / st.st_size) : 100;
+
+            if (pct != last_pct) {
+                print_progress_bar(offset, st.st_size);
+                last_pct = pct;
+            }
+        }
     }
+
+    print_progress_bar(st.st_size, st.st_size);
+    printf("\n");
 
     close(image_fd);
     return 0;
