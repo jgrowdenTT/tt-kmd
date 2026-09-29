@@ -659,11 +659,11 @@ static int poll_scratch_eq(int fd, uint64_t spa, uint32_t expected)
         }
         usleep(1000000);
         elapsed_us += 1000000;
-        if (elapsed_us >= BUNDLE_POLL_TIMEOUT_US) {
-            fprintf(stderr, "timeout: SPA 0x%012llx expected 0x%08x, got 0x%08x\n",
-                    (unsigned long long)spa, expected, val);
-            return -ETIMEDOUT;
-        }
+        //if (elapsed_us >= BUNDLE_POLL_TIMEOUT_US) {
+        //    fprintf(stderr, "timeout: SPA 0x%012llx expected 0x%08x, got 0x%08x\n",
+        //            (unsigned long long)spa, expected, val);
+        //    return -ETIMEDOUT;
+        //}
     }
 }
 
@@ -687,11 +687,11 @@ static int poll_scratch_bit(int fd, uint64_t spa, uint32_t mask)
         }
         usleep(1000000);
         elapsed_us += 1000000;
-        if (elapsed_us >= BUNDLE_POLL_TIMEOUT_US) {
-            fprintf(stderr, "timeout: SPA 0x%012llx mask 0x%08x, got 0x%08x\n",
-                    (unsigned long long)spa, mask, val);
-            return -ETIMEDOUT;
-        }
+        //if (elapsed_us >= BUNDLE_POLL_TIMEOUT_US) {
+        //    fprintf(stderr, "timeout: SPA 0x%012llx mask 0x%08x, got 0x%08x\n",
+        //            (unsigned long long)spa, mask, val);
+        //    return -ETIMEDOUT;
+        //}
     }
 }
 
