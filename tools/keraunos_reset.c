@@ -657,8 +657,8 @@ static int poll_scratch_eq(int fd, uint64_t spa, uint32_t expected)
             printf("  -> 0x%08x\n", val);
             return 0;
         }
-        usleep(10000);
-        elapsed_us += 10000;
+        usleep(1000000);
+        elapsed_us += 1000000;
         if (elapsed_us >= BUNDLE_POLL_TIMEOUT_US) {
             fprintf(stderr, "timeout: SPA 0x%012llx expected 0x%08x, got 0x%08x\n",
                     (unsigned long long)spa, expected, val);
@@ -685,8 +685,8 @@ static int poll_scratch_bit(int fd, uint64_t spa, uint32_t mask)
             printf("  -> 0x%08x\n", val);
             return 0;
         }
-        usleep(10000);
-        elapsed_us += 10000;
+        usleep(1000000);
+        elapsed_us += 1000000;
         if (elapsed_us >= BUNDLE_POLL_TIMEOUT_US) {
             fprintf(stderr, "timeout: SPA 0x%012llx mask 0x%08x, got 0x%08x\n",
                     (unsigned long long)spa, mask, val);
