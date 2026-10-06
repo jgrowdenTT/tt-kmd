@@ -38,6 +38,7 @@
 
 #define KER_SMC_CORE_LOCAL_BASE 0xC0000000ULL
 #define KER_SPA_BASE_K       0x1202000000ULL
+#define KER_SPA_BASE_M0      0x1300000000ULL
 #define KER_SPA_BASE_M1      0x1308000000ULL
 #define KER_SCRATCH2_OFFSET  0x10110ULL
 #define KER_SCRATCH0_OFFSET  0x10100ULL
@@ -126,20 +127,24 @@ static uint64_t scratch2_spa(void)
 
 static int parse_mode_arg(const char *arg)
 {
-	if (arg == NULL || arg[0] == '\0' || arg[1] != '\0') {
+	if (arg == NULL) {
 		return -EINVAL;
 	}
 
-	switch (tolower((unsigned char)arg[0])) {
-	case 'k':
+	if (!strcasecmp(arg, "k")) {
 		g_spa_base = KER_SPA_BASE_K;
 		return 0;
-	case 'm':
-		 g_spa_base = KER_SPA_BASE_M1;
-		return 0;
-	default:
-		return -EINVAL;
 	}
+	if (!strcasecmp(arg, "m0")) {
+		g_spa_base = KER_SPA_BASE_M0;
+		return 0;
+	}
+	if (!strcasecmp(arg, "m1")) {
+		g_spa_base = KER_SPA_BASE_M1;
+		return 0;
+	}
+
+	return -EINVAL;
 }
 
 static int read32_ioctl(int fd, uint64_t spa, uint32_t *value)
@@ -445,12 +450,12 @@ static void handle_signal(int sig)
 static void usage(const char *prog)
 {
 	fprintf(stderr, "Usage:\n");
-	fprintf(stderr, "  %s <k|m> <device_id>\n", prog);
-	fprintf(stderr, "  %s <k|m> --helper <device_id>\n", prog);
-	fprintf(stderr, "  %s <k|m> -H <device_id>\n", prog);
+	fprintf(stderr, "  %s <k|m0|m1> <device_id>\n", prog);
+	fprintf(stderr, "  %s <k|m0|m1> --helper <device_id>\n", prog);
+	fprintf(stderr, "  %s <k|m0|m1> -H <device_id>\n", prog);
 	fprintf(stderr, "Examples:\n");
 	fprintf(stderr, "  %s k 0\n", prog);
-	fprintf(stderr, "  %s m --helper 0\n", prog);
+	fprintf(stderr, "  %s m1 --helper 0\n", prog);
 }
 
 static int dump_scratch_helper(int fd)
@@ -508,7 +513,7 @@ int main(int argc, char **argv)
 
 	rc = parse_mode_arg(argv[1]);
 	if (rc) {
-		fprintf(stderr, "Invalid mode '%s'. Expected 'k' or 'm'.\n", argv[1]);
+		fprintf(stderr, "Invalid mode '%s'. Expected 'k', 'm0', or 'm1'.\n", argv[1]);
 		usage(argv[0]);
 		return 2;
 	}
