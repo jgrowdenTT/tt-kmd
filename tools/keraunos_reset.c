@@ -49,6 +49,7 @@
 
 #define KER_SMC_CORE_LOCAL_BASE 0xC0000000ULL
 #define KER_SPA_BASE_K          0x1202000000ULL
+#define KER_SPA_BASE_M0         0x1300000000ULL
 #define KER_SPA_BASE_M1         0x1308000000ULL
 #define KER_RESET_CTRL_OFFSET   0x10020ULL
 #define KER_RESET_VECTOR0_OFFSET 0x10000ULL
@@ -1391,6 +1392,13 @@ int main(int argc, char **argv)
 
     if (direct_sysbuild_mode) {
         if (!skip_bl0p5_load) {
+            g_spa_base = KER_SPA_BASE_M0;
+            rc = do_bl0_boot(fd);
+            if (rc) {
+                close(fd);
+                return 1;
+            }
+
             g_spa_base = KER_SPA_BASE_M1;
             rc = do_bl0_boot(fd);
             if (rc) {
