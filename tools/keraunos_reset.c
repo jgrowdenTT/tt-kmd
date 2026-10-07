@@ -72,8 +72,6 @@
 /* BL0P5 execute location: 64KB from end of ram0 (0xC0160000 - 0x10000) */
 #define KER_SMC_BL0P5_LOAD_ADDR         0xC0150000ULL
 #define KER_SMC_KMIS_LOAD_ADDR          0xC0067000ULL
-#define MIMIR_SMC_MIS_LOAD_ADDR         (KER_SPA_BASE_M1 + \
-                                         (KER_SMC_KMIS_LOAD_ADDR - KER_SMC_CORE_LOCAL_BASE))
 /* Scratch registers used for the BL0P5 <-> host handshake (local addresses) */
 #define KER_HOST_BOOT_STATE_LOCAL        0xC0010160ULL  /* SCRATCH[12] */
 #define KER_BUNDLE_VALIDATION_LOCAL      0xC0010150ULL  /* SCRATCH[10] */
@@ -948,10 +946,8 @@ static int write_mis_bundle_to_staging(int fd, const char *kmis_path, off_t kmis
     if (rc) return rc;
     rc = write32_ioctl(fd, entry1_spa + 20, (uint32_t)((uint64_t)mmis_size >> 32));
     if (rc) return rc;
-    rc = write32_ioctl(fd, entry1_spa + 32, (uint32_t)MIMIR_SMC_MIS_LOAD_ADDR);
-    if (rc) return rc;
-    rc = write32_ioctl(fd, entry1_spa + 36,
-                       (uint32_t)(MIMIR_SMC_MIS_LOAD_ADDR >> 32));
+    /* Core-local; firmware translates it to each Mimir's SPA base. */
+    rc = write32_ioctl(fd, entry1_spa + 32, (uint32_t)KER_SMC_KMIS_LOAD_ADDR);
     if (rc) return rc;
     rc = write32_ioctl(fd, entry1_spa + 40, (uint32_t)KER_SMC_KMIS_LOAD_ADDR);
     if (rc) return rc;
