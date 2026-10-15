@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent Inc.
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// Keraunos VUART console via TENSTORRENT_IOCTL_KER_READ32/_KER_WRITE32.
+// Keraunos VUART console via TENSTORRENT_IOCTL_NOC_READ/_NOC_WRITE.
 //
 // Firmware contract:
 //   - SMC cpu_ctrl SCRATCH_2 stores a 32-bit pointer to a VUART descriptor.
@@ -30,8 +30,8 @@
 
 #define TENSTORRENT_IOCTL_MAGIC 0xFA
 #define TENSTORRENT_IOCTL_GET_DEVICE_INFO _IO(TENSTORRENT_IOCTL_MAGIC, 0)
-#define TENSTORRENT_IOCTL_KER_READ32      _IO(TENSTORRENT_IOCTL_MAGIC, 16)
-#define TENSTORRENT_IOCTL_KER_WRITE32     _IO(TENSTORRENT_IOCTL_MAGIC, 17)
+#define TENSTORRENT_IOCTL_NOC_READ        _IO(TENSTORRENT_IOCTL_MAGIC, 18)
+#define TENSTORRENT_IOCTL_NOC_WRITE       _IO(TENSTORRENT_IOCTL_MAGIC, 19)
 
 #define TENSTORRENT_PCI_VENDOR_ID 0x1e52
 #define KERAUNOS_PCI_DEVICE_ID    0xfeed
@@ -63,20 +63,16 @@ struct tenstorrent_get_device_info {
 	} out;
 };
 
-struct tenstorrent_ker_read32 {
+struct tenstorrent_noc_io {
 	__u32 argsz;
 	__u32 flags;
+	__u16 x;
+	__u16 y;
+	__u8 noc;
+	__u8 width;
+	__u8 reserved0[2];
 	__u64 addr;
-	__u32 value;
-	__u32 reserved;
-};
-
-struct tenstorrent_ker_write32 {
-	__u32 argsz;
-	__u32 flags;
-	__u64 addr;
-	__u32 value;
-	__u32 reserved;
+	__u64 value;
 };
 
 struct tt_vuart_desc {
@@ -149,26 +145,28 @@ static int parse_mode_arg(const char *arg)
 
 static int read32_ioctl(int fd, uint64_t spa, uint32_t *value)
 {
-	struct tenstorrent_ker_read32 io = {0};
+	struct tenstorrent_noc_io io = {0};
 
 	io.argsz = sizeof(io);
+	io.width = sizeof(uint32_t);
 	io.addr = spa;
-	if (ioctl(fd, TENSTORRENT_IOCTL_KER_READ32, &io) < 0) {
+	if (ioctl(fd, TENSTORRENT_IOCTL_NOC_READ, &io) < 0) {
 		return -errno;
 	}
 
-	*value = io.value;
+	*value = (uint32_t)io.value;
 	return 0;
 }
 
 static int write32_ioctl(int fd, uint64_t spa, uint32_t value)
 {
-	struct tenstorrent_ker_write32 io = {0};
+	struct tenstorrent_noc_io io = {0};
 
 	io.argsz = sizeof(io);
+	io.width = sizeof(uint32_t);
 	io.addr = spa;
 	io.value = value;
-	if (ioctl(fd, TENSTORRENT_IOCTL_KER_WRITE32, &io) < 0) {
+	if (ioctl(fd, TENSTORRENT_IOCTL_NOC_WRITE, &io) < 0) {
 		return -errno;
 	}
 
