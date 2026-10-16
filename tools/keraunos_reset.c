@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -51,6 +52,9 @@
 #define KER_SPA_BASE_K          0x1202000000ULL
 #define KER_SPA_BASE_M0         0x1300000000ULL
 #define KER_SPA_BASE_M1         0x1308000000ULL
+#define KER_SPA_BASE_M2         0x1310000000ULL
+#define KER_SPA_BASE_M3         0x1318000000ULL
+#define KER_SPA_BASE_Q0         0x19D8000000ULL
 #define KER_RESET_CTRL_OFFSET   0x10020ULL
 #define KER_RESET_VECTOR0_OFFSET 0x10000ULL
 #define KER_SCRATCH_BASE_OFFSET 0x10100ULL
@@ -204,11 +208,11 @@ static void usage(const char *prog)
 {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s --sysbuild <sysbuild_dir> [--skip-bl0p5-load] [device_id]\n", prog);
-    fprintf(stderr, "  %s <k|m> <0|1> [device_id]\n", prog);
-    fprintf(stderr, "  %s <k|m> --kbl1 <build_dir> [-r <hex_addr>] [device_id]\n", prog);
-    fprintf(stderr, "  %s <k|m> --blop5 --sysbuild <sysbuild_dir> [device_id]\n", prog);
-    fprintf(stderr, "  %s <k|m> --bl0 [device_id]\n", prog);
-    fprintf(stderr, "  k = SPA base 0x12020..., m = SPA base 0x13000...\n");
+    fprintf(stderr, "  %s <k|m0|m1|m2|m3|q0> <0|1> [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m0|m1|m2|m3|q0> --kbl1 <build_dir> [-r <hex_addr>] [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m0|m1|m2|m3|q0> --blop5 --sysbuild <sysbuild_dir> [device_id]\n", prog);
+    fprintf(stderr, "  %s <k|m0|m1|m2|m3|q0> --bl0 [device_id]\n", prog);
+    fprintf(stderr, "  k = SPA base 0x12020..., m0..m3 = SPA base 0x1300/0x1308/0x1310/0x1318..., m = m1, q0 = SPA base 0x19D8... (Q0)\n");
     fprintf(stderr, "  0 = hold SMC RISC-V in reset\n");
     fprintf(stderr, "  1 = release SMC RISC-V from reset\n");
     fprintf(stderr, "  --kbl1 = hold reset, load <build_dir>/zephyr/zephyr.bin, release reset\n");
@@ -225,20 +229,26 @@ static void usage(const char *prog)
 
 static int parse_mode_arg(const char *arg)
 {
-    if (arg == NULL || arg[0] == '\0' || arg[1] != '\0') {
+    if (arg == NULL) {
         return -EINVAL;
     }
 
-    switch (tolower((unsigned char)arg[0])) {
-    case 'k':
+    if (!strcasecmp(arg, "k")) {
         g_spa_base = KER_SPA_BASE_K;
-        return 0;
-    case 'm':
+    } else if (!strcasecmp(arg, "m0")) {
+        g_spa_base = KER_SPA_BASE_M0;
+    } else if (!strcasecmp(arg, "m") || !strcasecmp(arg, "m1")) {
         g_spa_base = KER_SPA_BASE_M1;
-        return 0;
-    default:
+    } else if (!strcasecmp(arg, "m2")) {
+        g_spa_base = KER_SPA_BASE_M2;
+    } else if (!strcasecmp(arg, "m3")) {
+        g_spa_base = KER_SPA_BASE_M3;
+    } else if (!strcasecmp(arg, "q0")) {
+        g_spa_base = KER_SPA_BASE_Q0;
+    } else {
         return -EINVAL;
     }
+    return 0;
 }
 
 static uint64_t reset_ctrl_spa(void)
@@ -1179,7 +1189,7 @@ int main(int argc, char **argv)
         rc = parse_mode_arg(argv[1]);
     }
     if (!direct_sysbuild_mode && rc) {
-        fprintf(stderr, "Invalid mode '%s'. Expected 'k' or 'm'.\n", argv[1]);
+        fprintf(stderr, "Invalid mode '%s'. Expected 'k', 'm0', 'm1', 'm2', 'm3' or 'q0'.\n", argv[1]);
         usage(argv[0]);
         return 2;
     }

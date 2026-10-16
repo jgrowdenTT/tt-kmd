@@ -40,6 +40,9 @@
 #define KER_SPA_BASE_K       0x1202000000ULL
 #define KER_SPA_BASE_M0      0x1300000000ULL
 #define KER_SPA_BASE_M1      0x1308000000ULL
+#define KER_SPA_BASE_M2      0x1310000000ULL
+#define KER_SPA_BASE_M3      0x1318000000ULL
+#define KER_SPA_BASE_Q0      0x19D8000000ULL
 #define KER_SCRATCH2_OFFSET  0x10110ULL
 #define KER_SCRATCH0_OFFSET  0x10100ULL
 #define KER_VUART_MAGIC       0x775e21a1u
@@ -137,6 +140,18 @@ static int parse_mode_arg(const char *arg)
 	}
 	if (!strcasecmp(arg, "m1")) {
 		g_spa_base = KER_SPA_BASE_M1;
+		return 0;
+	}
+	if (!strcasecmp(arg, "m2")) {
+		g_spa_base = KER_SPA_BASE_M2;
+		return 0;
+	}
+	if (!strcasecmp(arg, "m3")) {
+		g_spa_base = KER_SPA_BASE_M3;
+		return 0;
+	}
+	if (!strcasecmp(arg, "q0")) {
+		g_spa_base = KER_SPA_BASE_Q0;
 		return 0;
 	}
 
@@ -448,9 +463,9 @@ static void handle_signal(int sig)
 static void usage(const char *prog)
 {
 	fprintf(stderr, "Usage:\n");
-	fprintf(stderr, "  %s <k|m0|m1> <device_id>\n", prog);
-	fprintf(stderr, "  %s <k|m0|m1> --helper <device_id>\n", prog);
-	fprintf(stderr, "  %s <k|m0|m1> -H <device_id>\n", prog);
+	fprintf(stderr, "  %s <k|m0|m1|m2|m3|q0> <device_id>\n", prog);
+	fprintf(stderr, "  %s <k|m0|m1|m2|m3|q0> --helper <device_id>\n", prog);
+	fprintf(stderr, "  %s <k|m0|m1|m2|m3|q0> -H <device_id>\n", prog);
 	fprintf(stderr, "Examples:\n");
 	fprintf(stderr, "  %s k 0\n", prog);
 	fprintf(stderr, "  %s m1 --helper 0\n", prog);
@@ -511,7 +526,7 @@ int main(int argc, char **argv)
 
 	rc = parse_mode_arg(argv[1]);
 	if (rc) {
-		fprintf(stderr, "Invalid mode '%s'. Expected 'k', 'm0', or 'm1'.\n", argv[1]);
+		fprintf(stderr, "Invalid mode '%s'. Expected 'k', 'm0', 'm1', 'm2', 'm3', or 'q0'.\n", argv[1]);
 		usage(argv[0]);
 		return 2;
 	}

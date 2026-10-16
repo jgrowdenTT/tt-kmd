@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <inttypes.h>
@@ -40,7 +41,11 @@
 #define KERAUNOS_PCI_DEVICE_ID    0xfeed
 
 #define SMC_SPA_BASE_K 0x1202000000ULL
+#define SMC_SPA_BASE_M0 0x1300000000ULL
 #define SMC_SPA_BASE_M1 0x1308000000ULL
+#define SMC_SPA_BASE_M2 0x1310000000ULL
+#define SMC_SPA_BASE_M3 0x1318000000ULL
+#define SMC_SPA_BASE_Q0 0x19D8000000ULL
 
 /* Cold Scratch 3 register (msgqueue_info pointer), dts addr 0xc000280c */
 #define SMC_COLD_SCRATCH3_OFFSET 0x280cULL
@@ -130,20 +135,26 @@ static uint64_t smc_mbox_write_data_spa(unsigned int chan)
 
 static int parse_mode_arg(const char *arg)
 {
-	if (arg == NULL || arg[0] == '\0' || arg[1] != '\0') {
+	if (arg == NULL) {
 		return -EINVAL;
 	}
 
-	switch (tolower((unsigned char)arg[0])) {
-	case 'k':
+	if (!strcasecmp(arg, "k")) {
 		g_spa_base = SMC_SPA_BASE_K;
-		return 0;
-	case 'm':
-		   g_spa_base = SMC_SPA_BASE_M1;
-		return 0;
-	default:
+	} else if (!strcasecmp(arg, "m0")) {
+		g_spa_base = SMC_SPA_BASE_M0;
+	} else if (!strcasecmp(arg, "m1")) {
+		g_spa_base = SMC_SPA_BASE_M1;
+	} else if (!strcasecmp(arg, "m2")) {
+		g_spa_base = SMC_SPA_BASE_M2;
+	} else if (!strcasecmp(arg, "m3")) {
+		g_spa_base = SMC_SPA_BASE_M3;
+	} else if (!strcasecmp(arg, "q0")) {
+		g_spa_base = SMC_SPA_BASE_Q0;
+	} else {
 		return -EINVAL;
 	}
+	return 0;
 }
 
 static int read32_ioctl(int fd, uint64_t spa, uint32_t *value)
@@ -218,15 +229,15 @@ static int open_tt_dev(const char *path, uint16_t expected_device_id)
 static void usage(const char *prog)
 {
 	fprintf(stderr, "Usage:\n");
-	fprintf(stderr, "  %s <k|m> <word0> [word1] ... [word7]\n", prog);
+	fprintf(stderr, "  %s <k|m0|m1|m2|m3|q0> <word0> [word1] ... [word7]\n", prog);
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Send up to 8 words as message data to firmware.\n");
-	fprintf(stderr, "k uses SPA base 0x12020..., m uses SPA base 0x13000....\n");
+	fprintf(stderr, "k uses SPA base 0x12020..., m0 uses SPA base 0x13000...., m1 uses SPA base 0x13080...., m2/m3 use 0x13100.../0x13180...., q0 uses SPA base 0x19D8....\n");
 	fprintf(stderr, "Device is fixed to /dev/tenstorrent/0.\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Examples:\n");
 	fprintf(stderr, "  %s k 0x90                            # Send message type 0x90\n", prog);
-	fprintf(stderr, "  %s m 0x90 0x1234 0x5678              # Send with payload\n", prog);
+	fprintf(stderr, "  %s m1 0x90 0x1234 0x5678              # Send with payload\n", prog);
 	fprintf(stderr, "  %s k 0xfe 0 0 0 0 0 0 0              # SCRATCH_ONLY\n", prog);
 }
 
@@ -437,7 +448,7 @@ int main(int argc, char **argv)
 
 	rc = parse_mode_arg(argv[1]);
 	if (rc) {
-		fprintf(stderr, "Invalid mode '%s'. Expected 'k' or 'm'.\n", argv[1]);
+		fprintf(stderr, "Invalid mode '%s'. Expected 'k', 'm0', 'm1', 'm2', 'm3' or 'q0'.\n", argv[1]);
 		usage(argv[0]);
 		return 1;
 	}
