@@ -260,6 +260,11 @@ static int acquire_vuart(struct host_state *hs)
 		return rc;
 	}
 
+	/* Standalone images (no BL0/BL1 handoff) never publish SCRATCH_2; allow the local descriptor address to be given. */
+	if (ptr32 == 0 && getenv("KER_VUART_DESC")) {
+		ptr32 = (uint32_t)strtoul(getenv("KER_VUART_DESC"), NULL, 0);
+	}
+
 	desc_spa = (ptr32 >= KER_SMC_CORE_LOCAL_BASE)
 			   ? (g_spa_base + ((uint64_t)ptr32 - KER_SMC_CORE_LOCAL_BASE))
 			   : (uint64_t)ptr32;
