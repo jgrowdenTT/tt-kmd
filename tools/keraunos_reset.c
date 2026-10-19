@@ -177,6 +177,21 @@ static int write32_ioctl(int fd, uint64_t spa, uint32_t value)
     return 0;
 }
 
+static int write64_ioctl(int fd, uint64_t spa, uint64_t value)
+{
+    struct tenstorrent_noc_io io = {0};
+
+    io.argsz = sizeof(io);
+    io.width = sizeof(uint64_t);
+    io.addr = spa;
+    io.value = value;
+    if (ioctl(fd, TENSTORRENT_IOCTL_NOC_WRITE, &io) < 0) {
+        return -errno;
+    }
+
+    return 0;
+}
+
 static int open_tt_dev(const char *path, uint16_t expected_device_id)
 {
     int fd;
@@ -300,8 +315,8 @@ static int wipe_smc_sram(int fd)
 
     printf("Wiping SMC SRAM at SPA=0x%012llx..0x%012llx\n",
            (unsigned long long)base, (unsigned long long)(end - 1));
-    for (uint64_t spa = base; spa < end; spa += sizeof(uint32_t)) {
-        int rc = write32_ioctl(fd, spa, 0u);
+    for (uint64_t spa = base; spa < end; spa += sizeof(uint64_t)) {
+        int rc = write64_ioctl(fd, spa, 0u);
         if (rc) {
             fprintf(stderr, "write SRAM zero at SPA 0x%012llx failed: %s\n",
                     (unsigned long long)spa, strerror(-rc));
