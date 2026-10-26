@@ -26,8 +26,11 @@
 //   ./keraunos_reset <0|1> [device_id]
 //
 
+#include <dirent.h>
+#include <pwd.h>
 #include <errno.h>
 #include <ctype.h>
+#include <time.h>
 #include <fcntl.h>
 #include <linux/types.h>
 #include <limits.h>
@@ -1163,6 +1166,61 @@ static char *make_d2d_image_path_from_sysbuild(const char *sysbuild_dir)
         return NULL;
     }
     snprintf(path, len, "%s/%s%s", sysbuild_dir, "bl1_keraunos", suffix);
+
+    /* The Sival SDK is now extracted into a shared cache (see cmake/sival_sdk.cmake)
+     * rather than the build dir, so fall back to the newest cached copy. */
+    if (access(path, R_OK) != 0) {
+        const char *rel = "/grendel_sival_sdk/firmware/libs/chip_init/d2d_fw/d2d_fw.bin";
+        const char *env = getenv("TT_SIVAL_SDK_CACHE");
+        const char *home = getenv("HOME");
+        char cache[PATH_MAX];
+        char best[PATH_MAX] = "";
+        time_t best_mtime = 0;
+        DIR *dir;
+        struct dirent *de;
+
+        if (env) {
+            snprintf(cache, sizeof(cache), "%s", env);
+        } else if (home) {
+            /* Under sudo, HOME is root's; use the invoking user's cache. */
+            const char *sudo_user = getenv("SUDO_USER");
+            struct passwd *pw = sudo_user ? getpwnam(sudo_user) : NULL;
+
+            snprintf(cache, sizeof(cache), "%s/.cache/tt-sival-sdk",
+                     pw ? pw->pw_dir : home);
+        } else {
+            return path;
+        }
+
+        dir = opendir(cache);
+        if (!dir) {
+            return path;
+        }
+        while ((de = readdir(dir)) != NULL) {
+            char cand[PATH_MAX];
+            struct stat st;
+
+            if (de->d_name[0] == '.') {
+                continue;
+            }
+            if (snprintf(cand, sizeof(cand), "%s/%s%s", cache, de->d_name, rel) >= (int)sizeof(cand)) {
+                continue;
+            }
+            if (stat(cand, &st) == 0 && S_ISREG(st.st_mode) && st.st_mtime >= best_mtime) {
+                best_mtime = st.st_mtime;
+                snprintf(best, sizeof(best), "%s", cand);
+            }
+        }
+        closedir(dir);
+
+        if (best[0]) {
+            char *resolved = strdup(best);
+            if (resolved) {
+                free(path);
+                path = resolved;
+            }
+        }
+    }
     return path;
 }
 
