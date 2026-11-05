@@ -173,6 +173,21 @@ static int read32_ioctl(int fd, uint64_t spa, uint32_t *value)
 	return 0;
 }
 
+static int read64_ioctl(int fd, uint64_t spa, uint64_t *value)
+{
+	struct tenstorrent_noc_io io = {0};
+
+	io.argsz = sizeof(io);
+	io.width = sizeof(uint64_t);
+	io.addr = spa;
+	if (ioctl(fd, TENSTORRENT_IOCTL_NOC_READ, &io) < 0) {
+		return -errno;
+	}
+
+	*value = io.value;
+	return 0;
+}
+
 static int write32_ioctl(int fd, uint64_t spa, uint32_t value)
 {
 	struct tenstorrent_noc_io io = {0};
@@ -185,22 +200,6 @@ static int write32_ioctl(int fd, uint64_t spa, uint32_t value)
 		return -errno;
 	}
 
-	return 0;
-}
-
-static int read_u8_ioctl(int fd, uint64_t spa, uint8_t *value)
-{
-	uint64_t word_spa = spa & ~0x3ULL;
-	uint32_t word = 0;
-	uint32_t shift = (uint32_t)((spa & 0x3ULL) * 8ULL);
-	int rc;
-
-	rc = read32_ioctl(fd, word_spa, &word);
-	if (rc) {
-		return rc;
-	}
-
-	*value = (uint8_t)((word >> shift) & 0xffu);
 	return 0;
 }
 
@@ -227,10 +226,27 @@ static int read_desc(struct host_state *hs)
 	uint32_t words[9];
 	size_t i;
 
-	for (i = 0; i < 9; i++) {
-		rc = read32_ioctl(hs->fd, hs->desc_spa + (i * 4ULL), &words[i]);
+	if ((hs->desc_spa & 0x7ULL) == 0) {
+		for (i = 0; i < 8; i += 2) {
+			uint64_t q = 0;
+
+			rc = read64_ioctl(hs->fd, hs->desc_spa + (i * 4ULL), &q);
+			if (rc) {
+				return rc;
+			}
+			words[i] = (uint32_t)q;
+			words[i + 1] = (uint32_t)(q >> 32);
+		}
+		rc = read32_ioctl(hs->fd, hs->desc_spa + (8ULL * 4ULL), &words[8]);
 		if (rc) {
 			return rc;
+		}
+	} else {
+		for (i = 0; i < 9; i++) {
+			rc = read32_ioctl(hs->fd, hs->desc_spa + (i * 4ULL), &words[i]);
+			if (rc) {
+				return rc;
+			}
 		}
 	}
 
@@ -328,19 +344,34 @@ static int drain_device_tx(struct host_state *hs)
 	tail = hs->d.tx_tail;
 	cap = hs->d.tx_cap;
 
-	while (buf_size(head, tail) > 0) {
-		uint32_t idx = head % cap;
-		unsigned char ch;
+	/* Read the ring 8 bytes per ioctl (aligned, as the driver requires) and write stdout in chunks. */
+	unsigned char out[512];
+	size_t out_len = 0;
+	uint64_t word_spa = UINT64_MAX;
+	uint64_t word = 0;
 
-		rc = read_u8_ioctl(hs->fd, tx_buf_spa(hs) + idx, &ch);
-		if (rc) {
-			return rc;
+	while (buf_size(head, tail) > 0) {
+		uint64_t spa = tx_buf_spa(hs) + (head % cap);
+
+		if ((spa & ~0x7ULL) != word_spa) {
+			word_spa = spa & ~0x7ULL;
+			rc = read64_ioctl(hs->fd, word_spa, &word);
+			if (rc) {
+				return rc;
+			}
 		}
-		if (write(STDOUT_FILENO, &ch, 1) < 0) {
-			return -errno;
+		out[out_len++] = (unsigned char)(word >> ((spa & 0x7ULL) * 8ULL));
+		if (out_len == sizeof(out)) {
+			if (write(STDOUT_FILENO, out, out_len) < 0) {
+				return -errno;
+			}
+			out_len = 0;
 		}
 
 		head++;
+	}
+	if (out_len && write(STDOUT_FILENO, out, out_len) < 0) {
+		return -errno;
 	}
 
 	if (head != hs->d.tx_head) {
