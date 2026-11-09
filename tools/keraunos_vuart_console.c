@@ -32,6 +32,7 @@
 #define TENSTORRENT_IOCTL_GET_DEVICE_INFO _IO(TENSTORRENT_IOCTL_MAGIC, 0)
 #define TENSTORRENT_IOCTL_NOC_READ        _IO(TENSTORRENT_IOCTL_MAGIC, 18)
 #define TENSTORRENT_IOCTL_NOC_WRITE       _IO(TENSTORRENT_IOCTL_MAGIC, 19)
+#define TENSTORRENT_IOCTL_DEV_NOC_READ_BLOCK  _IO(TENSTORRENT_IOCTL_MAGIC, 0x81)
 
 #define TENSTORRENT_PCI_VENDOR_ID 0x1e52
 #define KERAUNOS_PCI_DEVICE_ID    0xfeed
@@ -77,6 +78,21 @@ struct tenstorrent_noc_io {
 	__u64 addr;
 	__u64 value;
 };
+
+struct tenstorrent_noc_block_io {
+	__u32 argsz;
+	__u32 flags;
+	__u16 x;
+	__u16 y;
+	__u8 noc;
+	__u8 reserved0[3];
+	__u64 addr;
+	__u64 data_ptr;
+	__u64 data_len;
+	__u64 bytes_transferred;
+};
+
+#define KER_READ_SPAN_MAX 4096u
 
 struct tt_vuart_desc {
 	uint32_t magic;
@@ -203,6 +219,88 @@ static int write32_ioctl(int fd, uint64_t spa, uint32_t value)
 	return 0;
 }
 
+static int read_bulk64_ioctl(int fd, uint64_t spa, void *buf, size_t len)
+{
+	struct tenstorrent_noc_block_io io = {0};
+
+	io.argsz = sizeof(io);
+	io.addr = spa;
+	io.data_ptr = (uintptr_t)buf;
+	io.data_len = len;
+	if (ioctl(fd, TENSTORRENT_IOCTL_DEV_NOC_READ_BLOCK, &io) < 0) {
+		return -errno;
+	}
+
+	return 0;
+}
+
+// Probe without touching the device: a NULL buffer passes request validation and then fails
+// page pinning with EFAULT. Older kmds reject the unknown ioctl (EINVAL/ENOTTY) and get the
+// 64-bit scalar fallback.
+static int has_bulk_read(int fd, uint64_t spa)
+{
+	static int supported = -1;
+
+	if (supported < 0) {
+		supported = (read_bulk64_ioctl(fd, spa, NULL, 4) == -EFAULT);
+	}
+	return supported;
+}
+
+// Read bytes [spa, spa + len) with one block ioctl (len <= KER_READ_SPAN_MAX). The span is
+// widened to 8-byte alignment so the driver can use 64-bit accesses.
+static int read_span(int fd, uint64_t spa, void *out, size_t len)
+{
+	uint64_t words[KER_READ_SPAN_MAX / 8 + 2];
+	uint64_t start = spa & ~0x7ULL;
+	uint64_t end = (spa + len + 7) & ~0x7ULL;
+	size_t span = (size_t)(end - start);
+	int rc;
+
+	if (len == 0) {
+		return 0;
+	}
+	if (len > KER_READ_SPAN_MAX) {
+		return -EINVAL;
+	}
+
+	if (has_bulk_read(fd, start)) {
+		rc = read_bulk64_ioctl(fd, start, words, span);
+		if (rc) {
+			return rc;
+		}
+	} else {
+		for (size_t i = 0; i < span / 8; i++) {
+			rc = read64_ioctl(fd, start + (i * 8ULL), &words[i]);
+			if (rc) {
+				return rc;
+			}
+		}
+	}
+
+	memcpy(out, (unsigned char *)words + (spa - start), len);
+	return 0;
+}
+
+static int write_all(int fd, const void *buf, size_t len)
+{
+	const unsigned char *p = buf;
+
+	while (len) {
+		ssize_t n = write(fd, p, len);
+
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return -errno;
+		}
+		p += n;
+		len -= (size_t)n;
+	}
+	return 0;
+}
+
 static int write_u8_ioctl(int fd, uint64_t spa, uint8_t value)
 {
 	uint64_t word_spa = spa & ~0x3ULL;
@@ -224,30 +322,10 @@ static int read_desc(struct host_state *hs)
 {
 	int rc;
 	uint32_t words[9];
-	size_t i;
 
-	if ((hs->desc_spa & 0x7ULL) == 0) {
-		for (i = 0; i < 8; i += 2) {
-			uint64_t q = 0;
-
-			rc = read64_ioctl(hs->fd, hs->desc_spa + (i * 4ULL), &q);
-			if (rc) {
-				return rc;
-			}
-			words[i] = (uint32_t)q;
-			words[i + 1] = (uint32_t)(q >> 32);
-		}
-		rc = read32_ioctl(hs->fd, hs->desc_spa + (8ULL * 4ULL), &words[8]);
-		if (rc) {
-			return rc;
-		}
-	} else {
-		for (i = 0; i < 9; i++) {
-			rc = read32_ioctl(hs->fd, hs->desc_spa + (i * 4ULL), &words[i]);
-			if (rc) {
-				return rc;
-			}
-		}
+	rc = read_span(hs->fd, hs->desc_spa, words, sizeof(words));
+	if (rc) {
+		return rc;
 	}
 
 	hs->d.magic = words[0];
@@ -344,34 +422,29 @@ static int drain_device_tx(struct host_state *hs)
 	tail = hs->d.tx_tail;
 	cap = hs->d.tx_cap;
 
-	/* Read the ring 8 bytes per ioctl (aligned, as the driver requires) and write stdout in chunks. */
-	unsigned char out[512];
-	size_t out_len = 0;
-	uint64_t word_spa = UINT64_MAX;
-	uint64_t word = 0;
-
+	/* Copy out each contiguous run of the ring with one bulk read. */
 	while (buf_size(head, tail) > 0) {
-		uint64_t spa = tx_buf_spa(hs) + (head % cap);
+		unsigned char out[KER_READ_SPAN_MAX];
+		uint32_t idx = head % cap;
+		uint32_t n = buf_size(head, tail);
 
-		if ((spa & ~0x7ULL) != word_spa) {
-			word_spa = spa & ~0x7ULL;
-			rc = read64_ioctl(hs->fd, word_spa, &word);
-			if (rc) {
-				return rc;
-			}
+		if (n > cap - idx) {
+			n = cap - idx;
 		}
-		out[out_len++] = (unsigned char)(word >> ((spa & 0x7ULL) * 8ULL));
-		if (out_len == sizeof(out)) {
-			if (write(STDOUT_FILENO, out, out_len) < 0) {
-				return -errno;
-			}
-			out_len = 0;
+		if (n > sizeof(out)) {
+			n = sizeof(out);
 		}
 
-		head++;
-	}
-	if (out_len && write(STDOUT_FILENO, out, out_len) < 0) {
-		return -errno;
+		rc = read_span(hs->fd, tx_buf_spa(hs) + idx, out, n);
+		if (rc) {
+			return rc;
+		}
+		rc = write_all(STDOUT_FILENO, out, n);
+		if (rc) {
+			return rc;
+		}
+
+		head += n;
 	}
 
 	if (head != hs->d.tx_head) {

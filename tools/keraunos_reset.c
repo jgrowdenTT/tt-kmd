@@ -47,6 +47,8 @@
 #define TENSTORRENT_IOCTL_GET_DEVICE_INFO _IO(TENSTORRENT_IOCTL_MAGIC, 0)
 #define TENSTORRENT_IOCTL_NOC_READ        _IO(TENSTORRENT_IOCTL_MAGIC, 18)
 #define TENSTORRENT_IOCTL_NOC_WRITE       _IO(TENSTORRENT_IOCTL_MAGIC, 19)
+#define TENSTORRENT_IOCTL_DEV_NOC_READ_BLOCK  _IO(TENSTORRENT_IOCTL_MAGIC, 0x81)
+#define TENSTORRENT_IOCTL_DEV_NOC_WRITE_BLOCK _IO(TENSTORRENT_IOCTL_MAGIC, 0x82)
 
 #define TENSTORRENT_PCI_VENDOR_ID 0x1e52
 #define KERAUNOS_PCI_DEVICE_ID    0xfeed
@@ -148,6 +150,19 @@ struct tenstorrent_noc_io {
     __u64 value;
 };
 
+struct tenstorrent_noc_block_io {
+    __u32 argsz;
+    __u32 flags;
+    __u16 x;
+    __u16 y;
+    __u8 noc;
+    __u8 reserved0[3];
+    __u64 addr;
+    __u64 data_ptr;
+    __u64 data_len;
+    __u64 bytes_transferred;
+};
+
 static uint64_t g_spa_base = KER_SPA_BASE_K;
 
 static int read32_ioctl(int fd, uint64_t spa, uint32_t *value)
@@ -192,6 +207,228 @@ static int write64_ioctl(int fd, uint64_t spa, uint64_t value)
         return -errno;
     }
 
+    return 0;
+}
+
+static int read64_ioctl(int fd, uint64_t spa, uint64_t *value)
+{
+    struct tenstorrent_noc_io io = {0};
+
+    io.argsz = sizeof(io);
+    io.width = sizeof(uint64_t);
+    io.addr = spa;
+    if (ioctl(fd, TENSTORRENT_IOCTL_NOC_READ, &io) < 0) {
+        return -errno;
+    }
+
+    *value = io.value;
+    return 0;
+}
+
+static int bulk64_ioctl(int fd, unsigned long req, uint64_t spa, const void *buf, size_t len)
+{
+    struct tenstorrent_noc_block_io io = {0};
+
+    io.argsz = sizeof(io);
+    io.addr = spa;
+    io.data_ptr = (uintptr_t)buf;
+    io.data_len = len;
+    if (ioctl(fd, req, &io) < 0) {
+        return -errno;
+    }
+
+    return 0;
+}
+
+/*
+ * Probe for the block ioctls without touching the device: a NULL buffer passes request validation
+ * and then fails page pinning with EFAULT. Older kmds reject the unknown ioctl (EINVAL/ENOTTY) and
+ * get the 64-bit scalar fallback.
+ */
+static int has_bulk(int fd)
+{
+    static int supported = -1;
+
+    if (supported < 0) {
+        supported = (bulk64_ioctl(fd, TENSTORRENT_IOCTL_DEV_NOC_WRITE_BLOCK, g_spa_base, NULL, 4) == -EFAULT);
+    }
+    return supported;
+}
+
+/* spa 8-aligned, len a multiple of 8. */
+static int write_words64(int fd, uint64_t spa, const void *buf, size_t len)
+{
+    if (has_bulk(fd)) {
+        return bulk64_ioctl(fd, TENSTORRENT_IOCTL_DEV_NOC_WRITE_BLOCK, spa, buf, len);
+    }
+    for (size_t off = 0; off < len; off += 8) {
+        uint64_t v;
+        int rc;
+
+        memcpy(&v, (const uint8_t *)buf + off, sizeof(v));
+        rc = write64_ioctl(fd, spa + off, v);
+        if (rc) {
+            return rc;
+        }
+    }
+    return 0;
+}
+
+/* spa 8-aligned, len a multiple of 8. */
+static int read_words64(int fd, uint64_t spa, void *buf, size_t len)
+{
+    if (has_bulk(fd)) {
+        return bulk64_ioctl(fd, TENSTORRENT_IOCTL_DEV_NOC_READ_BLOCK, spa, buf, len);
+    }
+    for (size_t off = 0; off < len; off += 8) {
+        uint64_t v;
+        int rc = read64_ioctl(fd, spa + off, &v);
+
+        if (rc) {
+            return rc;
+        }
+        memcpy((uint8_t *)buf + off, &v, sizeof(v));
+    }
+    return 0;
+}
+
+static void print_progress_bar(off_t done, off_t total);
+
+/*
+ * Write len bytes (a multiple of 4) to 4-aligned spa: 32-bit writes for an unaligned first/last
+ * word, 64-bit bulk writes in between. Optionally draws a progress bar.
+ */
+static int write_words(int fd, uint64_t spa, const uint8_t *data, size_t len, int progress)
+{
+    const size_t chunk = 64 * 1024;
+    size_t done = 0;
+    size_t mid;
+    uint32_t w;
+    int rc;
+
+    if ((spa & 0x3ULL) || (len & 0x3u)) {
+        return -EINVAL;
+    }
+
+    if ((spa & 0x7ULL) && len >= 4) {
+        memcpy(&w, data, 4);
+        rc = write32_ioctl(fd, spa, w);
+        if (rc) {
+            return rc;
+        }
+        done = 4;
+    }
+
+    mid = done + ((len - done) & ~(size_t)0x7);
+    while (done < mid) {
+        size_t n = (mid - done < chunk) ? (mid - done) : chunk;
+
+        rc = write_words64(fd, spa + done, data + done, n);
+        if (rc) {
+            return rc;
+        }
+        done += n;
+        if (progress) {
+            print_progress_bar((off_t)done, (off_t)len);
+        }
+    }
+
+    if (done < len) {
+        memcpy(&w, data + done, 4);
+        rc = write32_ioctl(fd, spa + done, w);
+        if (rc) {
+            return rc;
+        }
+    }
+    if (progress) {
+        print_progress_bar((off_t)len, (off_t)len);
+    }
+    return 0;
+}
+
+static int zero_words(int fd, uint64_t spa, size_t len)
+{
+    uint8_t *zeros = calloc(1, len ? len : 1);
+    int rc;
+
+    if (!zeros) {
+        return -ENOMEM;
+    }
+    rc = write_words(fd, spa, zeros, len, 0);
+    free(zeros);
+    return rc;
+}
+
+/* Read bytes [spa, spa + len) via 8-aligned bulk reads. */
+static int read_bytes(int fd, uint64_t spa, uint8_t *out, size_t len)
+{
+    uint64_t start = spa & ~0x7ULL;
+    size_t span = (size_t)(((spa + len + 7) & ~0x7ULL) - start);
+    uint8_t *tmp;
+    int rc;
+
+    if (len == 0) {
+        return 0;
+    }
+    tmp = malloc(span);
+    if (!tmp) {
+        return -ENOMEM;
+    }
+    rc = read_words64(fd, start, tmp, span);
+    if (!rc) {
+        memcpy(out, tmp + (spa - start), len);
+    }
+    free(tmp);
+    return rc;
+}
+
+/* Read a regular file into a malloc'd buffer zero-padded to a multiple of 4 bytes. */
+static int read_image_file(const char *image_path, uint8_t **buf, size_t *size)
+{
+    struct stat st;
+    size_t got = 0;
+    uint8_t *data;
+    int rc;
+    int image_fd = open(image_path, O_RDONLY);
+
+    if (image_fd < 0) {
+        fprintf(stderr, "open image %s failed: %s\n", image_path, strerror(errno));
+        return -errno;
+    }
+    if (fstat(image_fd, &st) < 0) {
+        rc = -errno;
+        fprintf(stderr, "stat image %s failed: %s\n", image_path, strerror(errno));
+        close(image_fd);
+        return rc;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "image %s is not a regular file\n", image_path);
+        close(image_fd);
+        return -EINVAL;
+    }
+
+    data = calloc(1, ((size_t)st.st_size + 3) & ~(size_t)3);
+    if (!data && st.st_size) {
+        close(image_fd);
+        return -ENOMEM;
+    }
+    while (got < (size_t)st.st_size) {
+        ssize_t n = read(image_fd, data + got, (size_t)st.st_size - got);
+
+        if (n <= 0) {
+            rc = n < 0 ? -errno : -EIO;
+            fprintf(stderr, "read image %s failed at offset %zu: %s\n", image_path, got,
+                    n < 0 ? strerror(errno) : "short read");
+            free(data);
+            close(image_fd);
+            return rc;
+        }
+        got += (size_t)n;
+    }
+
+    close(image_fd);
+    *buf = data;
+    *size = got;
     return 0;
 }
 
@@ -315,18 +552,21 @@ static int wipe_smc_sram(int fd)
 {
     uint64_t base = local_addr_to_spa(KER_SMC_SRAM_BASE);
     uint64_t end = base + KER_SMC_SRAM_SIZE;
+    uint8_t *zeros = calloc(1, KER_SMC_SRAM_SIZE);
+    int rc;
 
+    if (!zeros) {
+        return -ENOMEM;
+    }
     printf("Wiping SMC SRAM at SPA=0x%012llx..0x%012llx\n",
            (unsigned long long)base, (unsigned long long)(end - 1));
-    for (uint64_t spa = base; spa < end; spa += sizeof(uint64_t)) {
-        int rc = write64_ioctl(fd, spa, 0u);
-        if (rc) {
-            fprintf(stderr, "write SRAM zero at SPA 0x%012llx failed: %s\n",
-                    (unsigned long long)spa, strerror(-rc));
-            return rc;
-        }
+    rc = write_words64(fd, base, zeros, KER_SMC_SRAM_SIZE);
+    if (rc) {
+        fprintf(stderr, "wipe SRAM at SPA 0x%012llx failed: %s\n",
+                (unsigned long long)base, strerror(-rc));
     }
-    return 0;
+    free(zeros);
+    return rc;
 }
 
 static uint64_t scratch_spa(unsigned int idx)
@@ -476,187 +716,101 @@ static void print_progress_bar(off_t done, off_t total)
 
 static int load_image_to_spa(int fd, const char *image_path, uint64_t load_spa)
 {
+    uint8_t *data = NULL;
+    size_t size = 0;
+    size_t padded;
     int rc;
-    int image_fd;
-    struct stat st;
-    off_t offset = 0;
-    int last_pct = -1;
 
-    image_fd = open(image_path, O_RDONLY);
-    if (image_fd < 0) {
-        fprintf(stderr, "open image %s failed: %s\n", image_path, strerror(errno));
-        return -errno;
-    }
-
-    if (fstat(image_fd, &st) < 0) {
-        rc = -errno;
-        fprintf(stderr, "stat image %s failed: %s\n", image_path, strerror(errno));
-        close(image_fd);
+    rc = read_image_file(image_path, &data, &size);
+    if (rc) {
         return rc;
     }
-
-    if (!S_ISREG(st.st_mode)) {
-        fprintf(stderr, "image %s is not a regular file\n", image_path);
-        close(image_fd);
+    if (load_spa & 0x3ULL) {
+        fprintf(stderr, "load SPA 0x%012llx is not 4-byte aligned\n", (unsigned long long)load_spa);
+        free(data);
         return -EINVAL;
     }
 
-    printf("Loading %lld bytes from %s to SPA=0x%012llx\n",
-           (long long)st.st_size, image_path, (unsigned long long)load_spa);
+    printf("Loading %zu bytes from %s to SPA=0x%012llx\n",
+           size, image_path, (unsigned long long)load_spa);
 
-    while (offset < st.st_size) {
-        uint8_t bytes[4] = {0, 0, 0, 0};
-        uint32_t word;
-        ssize_t want = (st.st_size - offset >= 4) ? 4 : (ssize_t)(st.st_size - offset);
-        ssize_t got = read(image_fd, bytes, (size_t)want);
+    /* Preserve the target bytes past the end of the image in its last partial word. */
+    padded = (size + 3) & ~(size_t)3;
+    if (padded != size) {
+        uint32_t old_word = 0;
+        uint64_t spa = load_spa + padded - 4;
 
-        if (got < 0) {
-            rc = -errno;
-            fprintf(stderr, "read image %s failed at offset %lld: %s\n",
-                    image_path, (long long)offset, strerror(errno));
-            close(image_fd);
-            return rc;
-        }
-        if (got != want) {
-            fprintf(stderr, "short read from image %s at offset %lld\n", image_path, (long long)offset);
-            close(image_fd);
-            return -EIO;
-        }
-
-        if (got < 4) {
-            uint32_t old_word = 0;
-            rc = read32_ioctl(fd, load_spa + (uint64_t)offset, &old_word);
-            if (rc) {
-                fprintf(stderr, "read target word failed at SPA 0x%012llx: %s\n",
-                        (unsigned long long)(load_spa + (uint64_t)offset), strerror(-rc));
-                close(image_fd);
-                return rc;
-            }
-            bytes[2] = (got > 2) ? bytes[2] : (uint8_t)((old_word >> 16) & 0xffu);
-            bytes[3] = (got > 3) ? bytes[3] : (uint8_t)((old_word >> 24) & 0xffu);
-            if (got < 2) {
-                bytes[1] = (uint8_t)((old_word >> 8) & 0xffu);
-            }
-        }
-
-        word = (uint32_t)bytes[0] |
-               ((uint32_t)bytes[1] << 8) |
-               ((uint32_t)bytes[2] << 16) |
-               ((uint32_t)bytes[3] << 24);
-
-        rc = write32_ioctl(fd, load_spa + (uint64_t)offset, word);
+        rc = read32_ioctl(fd, spa, &old_word);
         if (rc) {
-            fprintf(stderr, "write target word failed at SPA 0x%012llx: %s\n",
-                    (unsigned long long)(load_spa + (uint64_t)offset), strerror(-rc));
-            close(image_fd);
+            fprintf(stderr, "read target word failed at SPA 0x%012llx: %s\n",
+                    (unsigned long long)spa, strerror(-rc));
+            free(data);
             return rc;
         }
-
-        offset += got;
-
-        {
-            int pct = (st.st_size > 0) ? (int)((offset * 100) / st.st_size) : 100;
-
-            if (pct != last_pct) {
-                print_progress_bar(offset, st.st_size);
-                last_pct = pct;
-            }
+        for (size_t i = size; i < padded; i++) {
+            data[i] = (uint8_t)(old_word >> (8 * (i - (padded - 4))));
         }
     }
 
-    print_progress_bar(st.st_size, st.st_size);
+    rc = write_words(fd, load_spa, data, padded, 1);
     printf("\n");
-
-    close(image_fd);
-    return 0;
+    if (rc) {
+        fprintf(stderr, "write image to SPA 0x%012llx failed: %s\n",
+                (unsigned long long)load_spa, strerror(-rc));
+    }
+    free(data);
+    return rc;
 }
 
 static int verify_image_at_spa(int fd, const char *image_path, uint64_t load_spa)
 {
+    uint8_t *expected = NULL;
+    uint8_t *actual;
+    size_t size = 0;
     int rc;
-    int image_fd;
-    struct stat st;
-    off_t offset = 0;
 
-    image_fd = open(image_path, O_RDONLY);
-    if (image_fd < 0) {
-        fprintf(stderr, "open image %s for verify failed: %s\n", image_path, strerror(errno));
-        return -errno;
-    }
-
-    if (fstat(image_fd, &st) < 0) {
-        rc = -errno;
-        fprintf(stderr, "stat image %s for verify failed: %s\n", image_path, strerror(errno));
-        close(image_fd);
+    rc = read_image_file(image_path, &expected, &size);
+    if (rc) {
         return rc;
     }
 
-    if (!S_ISREG(st.st_mode)) {
-        fprintf(stderr, "image %s is not a regular file\n", image_path);
-        close(image_fd);
-        return -EINVAL;
+    printf("Verifying %zu bytes at SPA=0x%012llx\n", size, (unsigned long long)load_spa);
+
+    actual = malloc(size ? size : 1);
+    if (!actual) {
+        free(expected);
+        return -ENOMEM;
+    }
+    rc = read_bytes(fd, load_spa, actual, size);
+    if (rc) {
+        fprintf(stderr, "read back from SPA 0x%012llx during verify failed: %s\n",
+                (unsigned long long)load_spa, strerror(-rc));
+        goto out;
     }
 
-    printf("Verifying %lld bytes at SPA=0x%012llx\n",
-           (long long)st.st_size, (unsigned long long)load_spa);
+    for (size_t off = 0; off < size; off++) {
+        if (actual[off] != expected[off]) {
+            size_t word_off = off & ~(size_t)3;
+            uint32_t exp_word = 0;
+            uint32_t act_word = 0;
 
-    while (offset < st.st_size) {
-        uint8_t bytes[4] = {0, 0, 0, 0};
-        uint32_t expected_word;
-        uint32_t actual_word = 0;
-        ssize_t want = (st.st_size - offset >= 4) ? 4 : (ssize_t)(st.st_size - offset);
-        ssize_t got = read(image_fd, bytes, (size_t)want);
-
-        if (got < 0) {
-            rc = -errno;
-            fprintf(stderr, "read image %s failed at offset %lld during verify: %s\n",
-                    image_path, (long long)offset, strerror(errno));
-            close(image_fd);
-            return rc;
-        }
-        if (got != want) {
-            fprintf(stderr, "short read from image %s at offset %lld during verify\n",
-                    image_path, (long long)offset);
-            close(image_fd);
-            return -EIO;
-        }
-
-        rc = read32_ioctl(fd, load_spa + (uint64_t)offset, &actual_word);
-        if (rc) {
-            fprintf(stderr, "read target word failed at SPA 0x%012llx during verify: %s\n",
-                    (unsigned long long)(load_spa + (uint64_t)offset), strerror(-rc));
-            close(image_fd);
-            return rc;
-        }
-
-        if (got < 4) {
-            bytes[2] = (got > 2) ? bytes[2] : (uint8_t)((actual_word >> 16) & 0xffu);
-            bytes[3] = (got > 3) ? bytes[3] : (uint8_t)((actual_word >> 24) & 0xffu);
-            if (got < 2) {
-                bytes[1] = (uint8_t)((actual_word >> 8) & 0xffu);
+            for (size_t i = 0; i < 4 && word_off + i < size; i++) {
+                exp_word |= (uint32_t)expected[word_off + i] << (8 * i);
+                act_word |= (uint32_t)actual[word_off + i] << (8 * i);
             }
-        }
-
-        expected_word = (uint32_t)bytes[0] |
-                        ((uint32_t)bytes[1] << 8) |
-                        ((uint32_t)bytes[2] << 16) |
-                        ((uint32_t)bytes[3] << 24);
-
-        if (actual_word != expected_word) {
             fprintf(stderr,
-                    "verify mismatch at SPA 0x%012llx (offset %lld): expected 0x%08x got 0x%08x\n",
-                    (unsigned long long)(load_spa + (uint64_t)offset),
-                    (long long)offset, expected_word, actual_word);
-            close(image_fd);
-            return -EIO;
+                    "verify mismatch at SPA 0x%012llx (offset %zu): expected 0x%08x got 0x%08x\n",
+                    (unsigned long long)(load_spa + word_off), word_off, exp_word, act_word);
+            rc = -EIO;
+            goto out;
         }
-
-        offset += got;
     }
-
-    close(image_fd);
     printf("Image verify passed\n");
-    return 0;
+
+out:
+    free(actual);
+    free(expected);
+    return rc;
 }
 
 static int verify_image_in_smc(int fd, const char *image_path)
@@ -726,7 +880,6 @@ static int poll_scratch_bit(int fd, uint64_t spa, uint32_t mask)
 static int write_bun1_to_staging(int fd)
 {
     int rc;
-    uint32_t i;
     uint64_t staging_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
 
     uint32_t hdr_words = (BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 2u * BUNDLE_TOC_ENTRY_SIZE) / 4;
@@ -737,14 +890,10 @@ static int write_bun1_to_staging(int fd)
            BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 3u * BUNDLE_TOC_ENTRY_SIZE);
 
     /* Zero the header region so unset fields don't contain stale values */
-    for (i = 0; i < hdr_words; i++)
-    {
-        rc = write32_ioctl(fd, staging_spa + (uint64_t)i * 4, 0u);
-        if (rc)
-        {
-            fprintf(stderr, "zero staging offset %u failed: %s\n", i * 4, strerror(-rc));
-            return rc;
-        }
+    rc = zero_words(fd, staging_spa, hdr_words * 4u);
+    if (rc) {
+        fprintf(stderr, "zero staging header failed: %s\n", strerror(-rc));
+        return rc;
     }
     uint64_t toc_spa = staging_spa + BUNDLE_MANIFEST_SIZE;
 
@@ -786,7 +935,6 @@ static int write_bun2_to_staging(int fd, const char *bl1_path, off_t image_size,
                      const char *d2d_path, off_t d2d_size)
 {
     int rc;
-    uint32_t i;
     /* BL0P5 expects the bundle manifest at 0xC0066400. */
     uint64_t staging_spa = local_addr_to_spa(KER_SMC_BL1_RESET_VECTOR);
     uint32_t hdr_words = (BUNDLE_MANIFEST_SIZE + BUNDLE_TOC_HDR_SIZE + 3u * BUNDLE_TOC_ENTRY_SIZE) / 4;
@@ -805,12 +953,10 @@ static int write_bun2_to_staging(int fd, const char *bl1_path, off_t image_size,
         (long long)image_size, (long long)d2d_size);
 
     /* Zero the header region so unset fields don't contain stale values */
-    for (i = 0; i < hdr_words; i++) {
-        rc = write32_ioctl(fd, staging_spa + (uint64_t)i * 4, 0u);
-        if (rc) {
-            fprintf(stderr, "zero staging offset %u failed: %s\n", i * 4, strerror(-rc));
-            return rc;
-        }
+    rc = zero_words(fd, staging_spa, hdr_words * 4u);
+    if (rc) {
+        fprintf(stderr, "zero staging header failed: %s\n", strerror(-rc));
+        return rc;
     }
 
     /* Manifest: only payload_offset (int64 at +1160) is read by the bun2 loader */
