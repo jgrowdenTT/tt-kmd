@@ -29,7 +29,7 @@
 // --topology selects the chip family the sysbuild images are staged for:
 //   mmk    : BL0 wipes M0, M1, K; BUN2 = kbl1[0], mbl1[1], d2d[2];
 //            BUN3 = kmis[0], mmis[1]
-//   qsr1a1 : BL0 wipes M1, M2, Q0, K; BUN2 = kbl1[0], mbl1[1], d2d[2], qbl1[4];
+//   qsr1a1 : BL0 wipes M0, M1, M2, M3, Q0, K; BUN2 = kbl1[0], mbl1[1], d2d[2], qbl1[4];
 //            BUN3 = kmis[0], mmis[1], qmis[2]
 //
 
@@ -1300,7 +1300,8 @@ static int do_sysbuild_bl0_boot(int fd, enum topology topo)
         KER_SPA_BASE_M0, KER_SPA_BASE_M1, KER_SPA_BASE_K,
     };
     static const uint64_t qsr1a1_bases[] = {
-        KER_SPA_BASE_M1, KER_SPA_BASE_M2, KER_SPA_BASE_Q0, KER_SPA_BASE_K,
+        KER_SPA_BASE_M0, KER_SPA_BASE_M1, KER_SPA_BASE_M2, KER_SPA_BASE_M3,
+        KER_SPA_BASE_Q0, KER_SPA_BASE_K,
     };
     const uint64_t *bases = mmk_bases;
     size_t count = sizeof(mmk_bases) / sizeof(mmk_bases[0]);
